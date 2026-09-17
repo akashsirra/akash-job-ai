@@ -1,17 +1,24 @@
 require("dotenv").config();
-
 const fs = require("fs");
-const puppeteer = require("puppeteer-core");
-const Browserbase = require("@browserbasehq/sdk");
 
-const profile = JSON.parse(fs.readFileSync("./profile.json", "utf8"));
-const rules = JSON.parse(fs.readFileSync("./job-rules.json", "utf8"));
+const PROFILE_PATH = "./profile.json";
+const RULES_PATH = "./job-rules.json";
+const QUEUE_PATH = "./job-queue.json";
+
+function readJson(path, fallback) {
+  if (!fs.existsSync(path)) return fallback;
+  return JSON.parse(fs.readFileSync(path, "utf8"));
+}
 
 function normalize(value) {
   return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function titlePatterns() {
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function titlePatterns(rules) {
   return [
     /software\s+(?:engineer|developer)/i,
     /software\s+development\s+engineer/i,
@@ -20,27 +27,20 @@ function titlePatterns() {
     /full[- ]?stack\s+(?:engineer|developer)/i,
     /graduate\s+engineer\s+trainee/i,
     /software\s+(?:engineer|developer)\s+trainee/i,
-    ...(rules.target_roles || []).map(role => new RegExp(
-      `\\b${String(role).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
-      "i"
-    ))
+    ...(rules.target_roles || []).map(role => new RegExp(`\\b${escapeRegex(role)}\\b`, "i"))
   ];
 }
 
-function looksLikeTargetTitle(title) {
+function looksLikeTargetTitle(title, rules) {
   const value = normalize(title);
-  return titlePatterns().some(pattern => pattern.test(value));
-}
-
-function looksLikeSearchPage(title, url) {
-  return /search results|jobs? in |job search|careers? home|find jobs|google\./i.test(`${title} ${url}`);
+  return titlePatterns(rules).some(pattern => pattern.test(value));
 }
 
 function canonicalUrl(url) {
   try {
     const parsed = new URL(url);
     if (!/^https?:$/.test(parsed.protocol)) return null;
-    if (/google\./i.test(parsed.hostname)) return null;
+    if (/(^|\.)google\./i.test(parsed.hostname)) return null;
     parsed.hash = "";
     return parsed.href;
   } catch {
@@ -48,115 +48,222 @@ function canonicalUrl(url) {
   }
 }
 
-function extractTitle(text) {
-  const lines = String(text || "")
-    .split(/\n|\r/)
-    .map(line => line.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-
-  const targetLine = lines.find(line => looksLikeTargetTitle(line));
-  if (targetLine) return targetLine.slice(0, 180);
-
-  const targetInline = lines.join(" ").match(/[^|•]{0,100}(?:software|backend|full[- ]?stack|sde|swe)[^|•]{0,100}/i);
-  return (targetInline ? targetInline[0] : lines[0] || "Unknown role").slice(0, 180).trim();
-}
-
-function buildQueries() {
-  const locations = rules.locations || ["Hyderabad", "Bangalore", "Remote India"];
-  const roleQueries = ["Software Engineer", "SDE", "Software Developer"];
-  return locations.flatMap(location =>
-    roleQueries.map(role => `"${role}" fresher "${location}" jobs`)
-  );
-}
-
-async function main() {
-  if (!process.env.BROWSERBASE_API_KEY || !process.env.BROWSERBASE_PROJECT_ID) {
-    throw new Error("BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID are required");
-  }
-
-  const queries = buildQueries();
-
-  const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
-  const session = await bb.sessions.create({
-    projectId: process.env.BROWSERBASE_PROJECT_ID
-  });
-  console.log("☁️ Browserbase session created");
-
-  const browser = await puppeteer.connect({ browserWSEndpoint: session.connectUrl });
-  const page = await browser.newPage();
-  const discovered = [];
-
+async function fetchJson(url, label) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
   try {
-    for (const query of queries) {
-      const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await new Promise(resolve => setTimeout(resolve, 1200));
-
-      const results = await page.evaluate(() =>
-        [...document.querySelectorAll("a")]
-          .map(a => ({
-            text: (a.innerText || "").trim().replace(/\s+/g, " "),
-            href: a.href
-          }))
-          .filter(x => x.text && x.href)
-      );
-
-      for (const result of results) {
-        const href = canonicalUrl(result.href);
-        const title = extractTitle(result.text);
-        if (!href || looksLikeSearchPage(result.text, href)) continue;
-        if (!looksLikeTargetTitle(title)) continue;
-        if (/^(images|videos|news|maps|shopping|more)$/i.test(title)) continue;
-
-        const existing = discovered.find(x => x.posting_url === href);
-        if (existing) {
-          existing.source_context.push(query, result.text);
-          continue;
-        }
-
-        discovered.push({
-          title,
-          company: "Unknown",
-          location: /bangalore/i.test(query)
-            ? "Bangalore, India"
-            : /hyderabad/i.test(query)
-              ? "Hyderabad, India"
-              : "Remote India",
-          posting_url: href,
-          source_context: [query, result.text],
-          status: "needs_verification",
-          browserbase_required: true
-        });
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "AkashJobAI/1.0",
+        Accept: "application/json,text/plain,*/*"
       }
+    });
+    if (!response.ok) {
+      console.warn(`⚠️ ${label}: HTTP ${response.status}`);
+      return null;
     }
+    return await response.json();
+  } catch (error) {
+    console.warn(`⚠️ ${label}: ${error.message}`);
+    return null;
   } finally {
-    await browser.close();
+    clearTimeout(timer);
   }
+}
 
-  const queue = fs.existsSync("./job-queue.json")
-    ? JSON.parse(fs.readFileSync("./job-queue.json", "utf8"))
-    : [];
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-  const merged = [...queue];
-  for (const job of discovered) {
+async function fetchLever(slug, companyName) {
+  const data = await fetchJson(
+    `https://api.lever.co/v0/postings/${encodeURIComponent(slug)}?mode=json`,
+    `lever:${slug}`
+  );
+  if (!Array.isArray(data)) return [];
+
+  return data.map(job => ({
+    title: job.text || "Unknown role",
+    company: companyName || slug,
+    location: job.categories?.location || "Unknown",
+    description: job.descriptionPlain || job.description || "",
+    posting_url: job.hostedUrl || job.applyUrl,
+    source_context: [`lever:${slug}`]
+  }));
+}
+
+async function fetchGreenhouse(slug, companyName) {
+  const data = await fetchJson(
+    `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(slug)}/jobs?content=true`,
+    `greenhouse:${slug}`
+  );
+  if (!data || !Array.isArray(data.jobs)) return [];
+
+  return data.jobs.map(job => ({
+    title: job.title || "Unknown role",
+    company: companyName || slug,
+    location: job.location?.name || "Unknown",
+    description: job.content || "",
+    posting_url: job.absolute_url,
+    source_context: [`greenhouse:${slug}`]
+  }));
+}
+
+async function fetchRemotive(query) {
+  const data = await fetchJson(
+    `https://remotive.com/api/remote-jobs?search=${encodeURIComponent(query)}`,
+    `remotive:${query}`
+  );
+  if (!data || !Array.isArray(data.jobs)) return [];
+
+  return data.jobs.map(job => ({
+    title: job.title || "Unknown role",
+    company: job.company_name || "Unknown",
+    location: job.candidate_required_location || "Remote",
+    description: job.description || "",
+    posting_url: job.url,
+    source_context: [`remotive:${query}`]
+  }));
+}
+
+function isUsefulLocation(location, rules) {
+  const value = normalize(location);
+  if (!value || value === "unknown") return true;
+  if (/remote|worldwide|anywhere/i.test(value)) return true;
+
+  const wanted = (rules.locations || []).map(normalize);
+  return wanted.some(target => {
+    if (target.includes("hyderabad")) return /hyderabad/i.test(value);
+    if (target.includes("bangalore")) return /bangalore|bengaluru/i.test(value);
+    if (target.includes("remote india")) return /india/i.test(value) && /remote|anywhere/i.test(value);
+    return value.includes(target);
+  });
+}
+
+function isObviouslySenior(candidate) {
+  const text = normalize(`${candidate.title} ${candidate.description}`);
+  return /\b(?:senior|sr\.?|staff|principal|lead|director|manager|head|vp|vice president)\b/i.test(text) &&
+    !/associate|junior|graduate|trainee|entry.?level/i.test(text);
+}
+
+function toQueueEntry(candidate, rules) {
+  const href = canonicalUrl(candidate.posting_url);
+  if (!href) return null;
+  if (!looksLikeTargetTitle(candidate.title, rules)) return null;
+  if (!isUsefulLocation(candidate.location, rules)) return null;
+  if (isObviouslySenior(candidate)) return null;
+
+  return {
+    title: String(candidate.title).slice(0, 180),
+    company: candidate.company || "Unknown",
+    location: candidate.location || "Unknown",
+    posting_url: href,
+    source_context: candidate.source_context || [],
+    status: "needs_verification",
+    browserbase_required: true
+  };
+}
+
+function dedupeAndMerge(existingQueue, newEntries) {
+  const merged = [...existingQueue];
+  let added = 0;
+
+  for (const job of newEntries) {
     const duplicate = merged.some(existing =>
       normalize(existing.posting_url) === normalize(job.posting_url) ||
       (normalize(existing.title) === normalize(job.title) &&
         normalize(existing.company) === normalize(job.company) &&
         normalize(existing.location) === normalize(job.location))
     );
-    if (!duplicate) merged.push(job);
+
+    if (!duplicate) {
+      merged.push(job);
+      added += 1;
+    }
   }
 
-  fs.writeFileSync("./job-queue.json", JSON.stringify(merged, null, 2));
+  return { merged, added };
+}
 
-  console.log(`\n🔎 Discovered ${discovered.length} candidate links`);
+async function collectCandidates(rules) {
+  const candidates = [];
+  const companies = rules.target_companies || [];
+
+  console.log(`📡 ATS companies: ${companies.length}`);
+
+  for (const target of companies) {
+    if (!target?.slug || !target?.ats) continue;
+
+    let jobs = [];
+    if (target.ats === "lever") {
+      jobs = await fetchLever(target.slug, target.name);
+    } else if (target.ats === "greenhouse") {
+      jobs = await fetchGreenhouse(target.slug, target.name);
+    } else {
+      console.warn(`⚠️ Unknown ATS: ${target.ats} (${target.name || target.slug})`);
+      continue;
+    }
+
+    console.log(`  ${target.name || target.slug}: ${jobs.length} postings`);
+    candidates.push(...jobs);
+    await sleep(200);
+  }
+
+  // Remotive is a secondary remote source. It never uses Browserbase.
+  for (const query of ["software engineer", "software developer", "backend engineer"]) {
+    candidates.push(...(await fetchRemotive(query)));
+    await sleep(200);
+  }
+
+  return candidates;
+}
+
+async function main() {
+  const profile = readJson(PROFILE_PATH, { name: "Unknown" });
+  const rules = readJson(RULES_PATH, {});
+  const existingQueue = readJson(QUEUE_PATH, []);
+
+  const rawCandidates = await collectCandidates(rules);
+  const seenUrls = new Set();
+  const discovered = [];
+
+  for (const candidate of rawCandidates) {
+    const entry = toQueueEntry(candidate, rules);
+    if (!entry) continue;
+
+    const key = normalize(entry.posting_url);
+    if (seenUrls.has(key)) continue;
+    seenUrls.add(key);
+    discovered.push(entry);
+  }
+
+  const { merged, added } = dedupeAndMerge(existingQueue, discovered);
+  fs.writeFileSync(QUEUE_PATH, JSON.stringify(merged, null, 2));
+
+  console.log(`\n🔎 Raw candidates fetched: ${rawCandidates.length}`);
+  console.log(`✅ Matched target-role candidates: ${discovered.length}`);
+  console.log(`🆕 New additions: ${added}`);
   console.log(`📋 Queue size: ${merged.length}`);
-  console.log("Browserbase sessions used: 1");
+  console.log("☁️ Browserbase sessions used: 0");
   console.log(`Profile: ${profile.name}`);
 }
 
-main().catch(error => {
-  console.error("\n❌ DISCOVERY ERROR:", error.message);
-  process.exit(1);
-});
+module.exports = {
+  normalize,
+  canonicalUrl,
+  looksLikeTargetTitle,
+  fetchLever,
+  fetchGreenhouse,
+  fetchRemotive,
+  toQueueEntry,
+  dedupeAndMerge,
+  collectCandidates
+};
+
+if (require.main === module) {
+  main().catch(error => {
+    console.error("\n❌ DISCOVERY ERROR:", error.message);
+    process.exit(1);
+  });
+}
