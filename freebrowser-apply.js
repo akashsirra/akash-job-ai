@@ -12,6 +12,7 @@ const NEVER_FILL = /password|passcode|otp|one[- ]time|verification|captcha|secur
 const FINAL_RE = /^(submit|submit application|send application|finish application|complete application|apply now|send my application)$/i;
 const NEXT_RE = /^(next|continue|continue application|save and continue|next step|review application|review and submit|proceed|go to next|save & continue)$/i;
 const APPLY_RE = /^(apply|apply now|apply for this job|start application|easy apply)$/i;
+const GATE_RE = /^(sign in|log in|login|register|sign up|create account|create your account)$/i;
 
 function norm(v) { return String(v ?? "").replace(/\s+/g, " ").trim().toLowerCase(); }
 function keyOf(f) { return `${f.label || ""} ${f.name || ""} ${f.id || ""} ${f.placeholder || ""} ${f.autocomplete || ""}`.toLowerCase(); }
@@ -72,6 +73,14 @@ async function controls(regexSource) {
     return [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")]
       .filter(visible).map(el => ({text:text(el), href:el.closest("a")?.href || el.href || ""}))
       .filter(x => x.text && re.test(x.text));
+  })()`);
+}
+
+async function visibleControls() {
+  return evaluate(`(() => {
+    const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0&&r.height>0&&s.display!=="none"&&s.visibility!=="hidden";};
+    const text=el=>(el.innerText||el.textContent||el.getAttribute("aria-label")||el.getAttribute("title")||"").replace(/\\s+/g," ").trim();
+    return [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")].filter(visible).map(el=>({text:text(el),href:el.closest("a")?.href||el.href||""})).filter(x=>x.text).slice(0,30);
   })()`);
 }
 
@@ -179,9 +188,22 @@ async function main() {
       continue;
     }
 
-    const draft={prepared_at:new Date().toISOString(),company:job.company,title:job.title,posting_url:startUrl,application_url:(await api("/status")).url,match:selected.match,fields_filled:filled,fields_skipped:skipped,unknown_required_fields:requiredUnknown,final_submission:"NOT PERFORMED"};
+    const gateControls=await controls(GATE_RE.source);
+    if(gateControls.length){
+      const gate=gateControls[0];
+      console.log(`🔐 Site gate detected: ${gate.text}`);
+      console.log(`➡️ ${gate.href || "No direct link"}`);
+      console.log("👤 Human sign-in/account action required; application submission was not performed.");
+      const draft={prepared_at:new Date().toISOString(),company:job.company,title:job.title,posting_url:startUrl,application_url:(await api("/status")).url,match:selected.match,fields_filled:filled,fields_skipped:skipped,unknown_required_fields:requiredUnknown,gate:gate,final_submission:"NOT PERFORMED"};
+      fs.writeFileSync("application-draft.json",JSON.stringify(draft,null,2));
+      console.log("💾 Saved application-draft.json");
+      return;
+    }
+
+    const allControls=await visibleControls();
+    console.log(`ℹ️ No unambiguous Next/Apply control found. Visible controls: ${allControls.map(x=>x.text).slice(0,12).join(" | ") || "none"}`);
+    const draft={prepared_at:new Date().toISOString(),company:job.company,title:job.title,posting_url:startUrl,application_url:(await api("/status")).url,match:selected.match,fields_filled:filled,fields_skipped:skipped,unknown_required_fields:requiredUnknown,visible_controls:allControls,final_submission:"NOT PERFORMED"};
     fs.writeFileSync("application-draft.json",JSON.stringify(draft,null,2));
-    console.log("ℹ️ No unambiguous Next/Apply control found; stopped safely.");
     console.log("💾 Saved application-draft.json");
     return;
   }
