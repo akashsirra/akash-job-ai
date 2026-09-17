@@ -6,7 +6,7 @@
   "scripts": {
     "status": "node pipeline.js status",
     "discover": "node discover-jobs.js",
-    "verify": "node inspect-posting.js",
+    "verify": "node inspect-posting.js && node classify-job-status.js",
     "match": "node matcher.js",
     "prepare": "node prepare-application.js",
     "mark-applied": "node mark-applied.js",
