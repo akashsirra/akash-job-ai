@@ -6,6 +6,7 @@ const steps = {
   verify: "inspect-posting.js",
   match: "matcher.js",
   prepare: "prepare-application.js",
+  apply: "freebrowser-apply.js",
   "mark-applied": "mark-applied.js"
 };
 
@@ -34,13 +35,14 @@ if (command === "status") {
   console.log(`Applied: ${applied}`);
   console.log(`Waiting for verification: ${waiting}`);
   console.log("\nCommands:");
-  console.log("  npm run discover      # one Browserbase session: find fresh links");
-  console.log("  npm run verify        # one Browserbase session: verify one job");
-  console.log("  npm run match         # local: match every queued job");
-  console.log("  npm run prepare       # one Browserbase session: prepare one application");
-  console.log("  npm run mark-applied -- --confirm  # after you manually submit");
-  console.log("  npm test              # local syntax/config smoke tests; no Browserbase");
-  console.log("\nFinal submission is intentionally never automated.");
+  console.log("  npm run discover      # find fresh links");
+  console.log("  npm run verify        # verify a job");
+  console.log("  npm run match         # match queued jobs locally");
+  console.log("  npm run prepare       # Browserbase application preparation");
+  console.log("  npm run apply         # FreeBrowser: open, fill, and advance an application");
+  console.log("  npm run mark-applied -- --confirm  # record a manually submitted application");
+  console.log("  npm test              # local smoke tests");
+  console.log("\nFreeBrowser application flow never invents answers and stops before final submission.");
 } else if (command === "all") {
   run("discover");
   run("verify");
