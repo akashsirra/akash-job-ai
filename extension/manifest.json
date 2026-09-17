@@ -1,0 +1,32 @@
+{
+  "manifest_version": 2,
+  "name": "ApplyPilot",
+  "version": "0.1.0",
+  "description": "AI-assisted job application form filler for Firefox Android.",
+  "permissions": ["storage", "activeTab", "tabs", "https://api.groq.com/*"],
+  "browser_action": {
+    "default_title": "ApplyPilot",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": false
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "applypilot@akashsirra.dev",
+      "strict_min_version": "109.0"
+    }
+  }
+}
