@@ -27,7 +27,7 @@ function valueForField(field) {
 }
 
 async function inspectFields(page) {
-  const inspect = async p => p.evaluate(() => [...document.querySelectorAll("input, textarea, select")].map((el, index) => ({
+  const inspect = async frame => frame.evaluate(() => [...document.querySelectorAll("input, textarea, select")].map((el, index) => ({
     index,
     tag: el.tagName.toLowerCase(),
     type: el.type || "",
@@ -39,84 +39,75 @@ async function inspectFields(page) {
     required: Boolean(el.required)
   })));
 
-  const top = await inspect(page);
-  if (top.length) return top;
-
   for (const frame of page.frames()) {
-    if (frame === page.mainFrame()) continue;
     try {
-      const fields = await frame.evaluate(() => [...document.querySelectorAll("input, textarea, select")].map((el, index) => ({
-        index,
-        tag: el.tagName.toLowerCase(),
-        type: el.type || "",
-        name: el.name || "",
-        id: el.id || "",
-        label: el.labels?.[0]?.innerText?.trim() || "",
-        placeholder: el.placeholder || "",
-        autocomplete: el.autocomplete || "",
-        required: Boolean(el.required)
-      })));
+      const fields = await inspect(frame);
       if (fields.length) return fields;
     } catch {}
   }
   return [];
 }
 
-async function findApply(page) {
-  return page.evaluate(() => {
+async function findApplyInFrame(frame) {
+  return frame.evaluate(() => {
     const visible = el => {
       const r = el.getBoundingClientRect();
       const s = getComputedStyle(el);
       return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
     };
-    const text = el => (el.innerText || el.textContent || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
-    return [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")]
-      .filter(visible)
-      .map(el => ({
-        text: text(el),
-        href: el.href || "",
-        tag: el.tagName.toLowerCase()
-      }))
-      .filter(x => /^apply( now)?$/i.test(x.text) || /apply now|apply for this job/i.test(x.text))
-      .find(x => !/add to cart|save/i.test(x.text));
+    const text = el => (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").replace(/\s+/g, " ").trim();
+    const nodes = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit],div,span")];
+    const el = nodes.find(x => {
+      const t = text(x);
+      return visible(x) && (/^apply( now)?$/i.test(t) || /apply now|apply for this job/i.test(t)) && !/add to cart|save/i.test(t);
+    });
+    if (!el) return null;
+    return {
+      text: text(el),
+      href: el.closest("a")?.href || el.href || "",
+      tag: el.tagName.toLowerCase()
+    };
   });
 }
 
 async function clickApply(page) {
-  const apply = await findApply(page);
-  if (!apply) return null;
+  for (const frame of page.frames()) {
+    try {
+      const apply = await findApplyInFrame(frame);
+      if (!apply) continue;
 
-  console.log("🔘 Apply control:", apply.text, apply.href || "(button)");
+      console.log("🔘 Apply control:", apply.text, apply.href || "(button)");
 
-  if (apply.href && !/^javascript:/i.test(apply.href) && !/app\.eightfold\.ai\/careers\?/i.test(apply.href)) {
-    return apply.href;
+      if (apply.href && !/^javascript:/i.test(apply.href) && !/app\.eightfold\.ai\/careers\?/i.test(apply.href)) {
+        return apply.href;
+      }
+
+      const before = page.url();
+      const pagesBefore = await page.browser().pages();
+      await frame.evaluate(() => {
+        const visible = el => {
+          const r = el.getBoundingClientRect();
+          const s = getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+        };
+        const text = el => (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").replace(/\s+/g, " ").trim();
+        const el = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit],div,span")].find(x => {
+          const t = text(x);
+          return visible(x) && (/^apply( now)?$/i.test(t) || /apply now|apply for this job/i.test(t)) && !/add to cart|save/i.test(t);
+        });
+        if (el) el.click();
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      if (page.url() !== before) return page.url();
+
+      const pagesAfter = await page.browser().pages();
+      const popup = pagesAfter.find(p => !pagesBefore.includes(p) && p.url() !== "about:blank");
+      if (popup) return popup;
+
+      return null;
+    } catch {}
   }
-
-  const before = page.url();
-  const pagesBefore = await page.browser().pages();
-
-  await page.evaluate(() => {
-    const visible = el => {
-      const r = el.getBoundingClientRect();
-      const s = getComputedStyle(el);
-      return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
-    };
-    const nodes = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")];
-    const el = nodes.find(x => {
-      const t = (x.innerText || x.textContent || x.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
-      return visible(x) && (/^apply( now)?$/i.test(t) || /apply now|apply for this job/i.test(t));
-    });
-    if (el) el.click();
-  });
-
-  await new Promise(resolve => setTimeout(resolve, 4000));
-
-  if (page.url() !== before) return page.url();
-
-  const pagesAfter = await page.browser().pages();
-  const popup = pagesAfter.find(p => !pagesBefore.includes(p) && p.url() !== "about:blank");
-  if (popup) return popup;
-
   return null;
 }
 
@@ -125,24 +116,14 @@ function eightfoldJobUrl(job) {
     const u = new URL(job.official_url);
     const m = u.pathname.match(/\/job\/(\d+)/i);
     if (!m) return null;
-
-    // Qualcomm's public Eightfold links use query + pid together.
-    const params = new URLSearchParams({
-      query: job.title || "",
-      pid: m[1],
-      domain: "qualcomm.com",
-      sort_by: "relevance",
-      triggerGoButton: "false"
-    });
-    return `https://app.eightfold.ai/careers?${params.toString()}`;
+    return `https://qualcomm.eightfold.ai/careers/job/${m[1]}`;
   } catch {
     return null;
   }
 }
 
-async function pageLooksLikeJob(page) {
-  const text = await page.evaluate(() => document.body.innerText.slice(0, 12000)).catch(() => "");
-  return /apply now/i.test(text) && /job id/i.test(text);
+async function pageText(page) {
+  return page.evaluate(() => document.body?.innerText?.slice(0, 16000) || "").catch(() => "");
 }
 
 async function main() {
@@ -166,19 +147,18 @@ async function main() {
   let page = await browser.newPage();
 
   try {
-    const eightfoldUrl = eightfoldJobUrl(candidate);
-    const startUrl = eightfoldUrl || candidate.official_url;
-    if (eightfoldUrl) console.log("↪️ Qualcomm Eightfold job search route:", eightfoldUrl);
+    const startUrl = eightfoldJobUrl(candidate) || candidate.official_url;
+    if (startUrl !== candidate.official_url) console.log("↪️ Qualcomm Eightfold job page:", startUrl);
 
     await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    await new Promise(resolve => setTimeout(resolve, 8000));
 
     let applicationUrl = page.url();
     let fields = await inspectFields(page);
+    let body = await pageText(page);
 
-    if (await pageLooksLikeJob(page)) {
-      console.log("✅ Qualcomm job listing loaded");
-    }
+    console.log("🌐 Loaded:", applicationUrl);
+    console.log("📄 Apply Now visible:", /apply now|apply for this job/i.test(body) ? "yes" : "no");
 
     const applyTarget = await clickApply(page);
     if (applyTarget) {
@@ -186,18 +166,18 @@ async function main() {
         console.log("🔗 Application portal:", applyTarget);
         const next = await browser.newPage();
         await next.goto(applyTarget, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await new Promise(resolve => setTimeout(resolve, 4000));
+        await new Promise(resolve => setTimeout(resolve, 5000));
         page = next;
       } else {
         page = applyTarget;
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await new Promise(resolve => setTimeout(resolve, 3000));
       }
       applicationUrl = page.url();
       fields = await inspectFields(page);
+      body = await pageText(page);
     }
 
-    const body = await page.evaluate(() => document.body.innerText.slice(0, 12000)).catch(() => "");
-    const genericSearch = /app\.eightfold\.ai\/careers\?/i.test(applicationUrl) && !/apply now/i.test(body);
+    const genericSearch = /app\.eightfold\.ai\/careers\?/i.test(applicationUrl) && !/apply now|apply for this job/i.test(body);
     if (genericSearch) fields = [];
 
     const draft = [];
@@ -221,6 +201,7 @@ async function main() {
       title: candidate.title,
       official_url: candidate.official_url,
       application_url: applicationUrl,
+      job_page_detected: /apply now|job id/i.test(body),
       fields: draft,
       unknown_required_fields: unknownRequired,
       final_submission: "NOT PERFORMED"
