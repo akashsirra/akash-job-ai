@@ -32,8 +32,7 @@ function titlePatterns(rules) {
 }
 
 function looksLikeTargetTitle(title, rules) {
-  const value = normalize(title);
-  return titlePatterns(rules).some(pattern => pattern.test(value));
+  return titlePatterns(rules).some(pattern => pattern.test(normalize(title)));
 }
 
 function canonicalUrl(url) {
@@ -48,9 +47,9 @@ function canonicalUrl(url) {
   }
 }
 
-async function fetchJson(url, label) {
+async function fetchJson(url, label, timeoutMs = 15000) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, {
       signal: controller.signal,
@@ -79,7 +78,8 @@ function sleep(ms) {
 async function fetchLever(slug, companyName) {
   const data = await fetchJson(
     `https://api.lever.co/v0/postings/${encodeURIComponent(slug)}?mode=json`,
-    `lever:${slug}`
+    `lever:${slug}`,
+    30000
   );
   if (!Array.isArray(data)) return [];
 
@@ -96,7 +96,8 @@ async function fetchLever(slug, companyName) {
 async function fetchGreenhouse(slug, companyName) {
   const data = await fetchJson(
     `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(slug)}/jobs?content=true`,
-    `greenhouse:${slug}`
+    `greenhouse:${slug}`,
+    30000
   );
   if (!data || !Array.isArray(data.jobs)) return [];
 
@@ -110,41 +111,116 @@ async function fetchGreenhouse(slug, companyName) {
   }));
 }
 
+async function fetchAshby(slug, companyName) {
+  const data = await fetchJson(
+    `https://api.ashbyhq.com/posting-api/job-board/${encodeURIComponent(slug)}`,
+    `ashby:${slug}`,
+    30000
+  );
+  if (!data || !Array.isArray(data.jobs)) return [];
+
+  return data.jobs.map(job => ({
+    title: job.title || "Unknown role",
+    company: companyName || slug,
+    location: job.location || (Array.isArray(job.locationRestrictions) ? job.locationRestrictions.join(", ") : "Unknown"),
+    description: job.descriptionPlain || job.description || "",
+    posting_url: job.jobUrl || job.applyUrl || job.externalUrl,
+    source_context: [`ashby:${slug}`]
+  }));
+}
+
 async function fetchRemotive(query) {
   const data = await fetchJson(
     `https://remotive.com/api/remote-jobs?search=${encodeURIComponent(query)}`,
-    `remotive:${query}`
+    `remotive:${query}`,
+    20000
   );
   if (!data || !Array.isArray(data.jobs)) return [];
 
   return data.jobs.map(job => ({
     title: job.title || "Unknown role",
     company: job.company_name || "Unknown",
-    location: job.candidate_required_location || "Remote",
+    location: job.candidate_required_location || "Unknown",
     description: job.description || "",
     posting_url: job.url,
     source_context: [`remotive:${query}`]
   }));
 }
 
-function isUsefulLocation(location, rules) {
-  const value = normalize(location);
-  if (!value || value === "unknown") return true;
-  if (/remote|worldwide|anywhere/i.test(value)) return true;
+async function fetchHimalayas(query) {
+  const params = new URLSearchParams({
+    q: query,
+    country: "India",
+    seniority: "Entry-level",
+    employment_type: "Full Time",
+    sort: "recent",
+    page: "1"
+  });
 
-  const wanted = (rules.locations || []).map(normalize);
-  return wanted.some(target => {
-    if (target.includes("hyderabad")) return /hyderabad/i.test(value);
-    if (target.includes("bangalore")) return /bangalore|bengaluru/i.test(value);
-    if (target.includes("remote india")) return /india/i.test(value) && /remote|anywhere/i.test(value);
-    return value.includes(target);
+  const data = await fetchJson(
+    `https://himalayas.app/jobs/api/search?${params.toString()}`,
+    `himalayas:${query}`,
+    20000
+  );
+  if (!data || !Array.isArray(data.jobs)) return [];
+
+  return data.jobs.map(job => {
+    const restrictions = Array.isArray(job.locationRestrictions)
+      ? job.locationRestrictions
+      : [];
+    const location = restrictions.length
+      ? `Remote - ${restrictions.join(", ")}`
+      : "Remote - Worldwide";
+
+    return {
+      title: job.title || "Unknown role",
+      company: job.companyName || "Unknown",
+      location,
+      description: job.description || job.excerpt || "",
+      posting_url: job.applicationLink || job.url,
+      source_context: ["himalayas"]
+    };
   });
 }
 
+function isUsefulLocation(location, rules) {
+  const value = normalize(location);
+  if (!value || value === "unknown") return false;
+
+  if (/hyderabad/i.test(value)) return true;
+  if (/bangalore|bengaluru/i.test(value)) return true;
+
+  // Remote India or worldwide remote is acceptable because the user's rules
+  // explicitly include Remote India. Worldwide roles are allowed only when
+  // the listing does not restrict the candidate's country.
+  if (/remote/i.test(value) && (/india/i.test(value) || /worldwide|anywhere/i.test(value))) {
+    return (rules.locations || []).some(x => /remote\s*india/i.test(String(x)));
+  }
+
+  return false;
+}
+
 function isObviouslySenior(candidate) {
-  const text = normalize(`${candidate.title} ${candidate.description}`);
-  return /\b(?:senior|sr\.?|staff|principal|lead|director|manager|head|vp|vice president)\b/i.test(text) &&
-    !/associate|junior|graduate|trainee|entry.?level/i.test(text);
+  const title = normalize(candidate.title);
+  const description = normalize(candidate.description);
+
+  // Title-level seniority is authoritative enough to reject immediately.
+  if (/\b(?:senior|sr\.?|staff|principal|lead|director|manager|head|vp|vice president)\b/i.test(title)) {
+    return true;
+  }
+
+  // Reject numbered engineering levels such as Engineer II/III/IV or SDE II/III.
+  if (/\b(?:engineer|developer|sde|swe)\s*(?:[- ]?(?:ii|iii|iv|v|vi)|[- ]?\d{2,})\b/i.test(title)) {
+    return true;
+  }
+
+  // Reject explicit >1-year requirements when stated in the title or body.
+  if (/\b(?:[2-9]|1\d|\d{2,})\s*\+?\s*years?\b/i.test(title)) return true;
+  if (/\b(?:[2-9]|1\d|\d{2,})\s*(?:-|to)\s*\d+\s*years?\b/i.test(title)) return true;
+  if (/\b(?:[2-9]|1\d|\d{2,})\s*\+?\s*years?\s+(?:of\s+)?experience\b/i.test(description)) return true;
+  if (/\b(?:[2-9]|1\d|\d{2,})\s*(?:-|to)\s*\d+\s*years?\s+(?:of\s+)?experience\b/i.test(description)) return true;
+
+  return false;
 }
 
 function toQueueEntry(candidate, rules) {
@@ -200,6 +276,8 @@ async function collectCandidates(rules) {
       jobs = await fetchLever(target.slug, target.name);
     } else if (target.ats === "greenhouse") {
       jobs = await fetchGreenhouse(target.slug, target.name);
+    } else if (target.ats === "ashby") {
+      jobs = await fetchAshby(target.slug, target.name);
     } else {
       console.warn(`⚠️ Unknown ATS: ${target.ats} (${target.name || target.slug})`);
       continue;
@@ -210,7 +288,19 @@ async function collectCandidates(rules) {
     await sleep(200);
   }
 
-  // Remotive is a secondary remote source. It never uses Browserbase.
+  // India-focused remote API. Search is already constrained to Entry-level +
+  // Full Time + India, so it is much more useful than scraping search pages.
+  for (const query of [
+    "software engineer",
+    "software developer",
+    "backend engineer",
+    "full stack developer"
+  ]) {
+    candidates.push(...(await fetchHimalayas(query)));
+    await sleep(250);
+  }
+
+  // Secondary remote source; final location/seniority filtering still applies.
   for (const query of ["software engineer", "software developer", "backend engineer"]) {
     candidates.push(...(await fetchRemotive(query)));
     await sleep(200);
@@ -255,7 +345,9 @@ module.exports = {
   looksLikeTargetTitle,
   fetchLever,
   fetchGreenhouse,
+  fetchAshby,
   fetchRemotive,
+  fetchHimalayas,
   toQueueEntry,
   dedupeAndMerge,
   collectCandidates
