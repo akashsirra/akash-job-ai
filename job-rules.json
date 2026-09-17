@@ -1,0 +1,52 @@
+{
+  "locations": [
+    "Hyderabad",
+    "Bangalore",
+    "Remote India"
+  ],
+  "experience": {
+    "max_years": 1,
+    "accept_fresher": true,
+    "accept_entry_level": true
+  },
+  "employment": [
+    "full-time"
+  ],
+  "target_roles": [
+    "Software Engineer",
+    "Software Developer",
+    "Software Development Engineer",
+    "SDE",
+    "Backend Engineer",
+    "Full-Stack Engineer",
+    "Full Stack Developer",
+    "Graduate Engineer Trainee",
+    "Software Engineer Trainee"
+  ],
+  "preferred_skills": [
+    "Python",
+    "JavaScript",
+    "TypeScript",
+    "React",
+    "Next.js",
+    "Node.js",
+    "Express",
+    "REST APIs",
+    "PostgreSQL",
+    "SQLite",
+    "Git",
+    "GitHub"
+  ],
+  "reject_if": [
+    "requires more than 1 year experience",
+    "sales",
+    "unpaid internship",
+    "unrelated role",
+    "AI training gig"
+  ],
+  "application_policy": {
+    "never_invent_information": true,
+    "stop_on_unknown_required_answer": true,
+    "stop_before_final_submission": true
+  }
+}

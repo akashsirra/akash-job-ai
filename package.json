@@ -1,0 +1,20 @@
+{
+  "name": "akash-job-ai",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@browserbasehq/sdk": "^2.20.0",
+    "dotenv": "^17.4.2",
+    "playwright": "^1.63.0",
+    "playwright-core": "^1.63.0",
+    "puppeteer-core": "^25.11.0"
+  }
+}
