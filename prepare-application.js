@@ -27,31 +27,68 @@ function valueForField(field) {
 }
 
 async function inspectFields(page) {
-  return page.evaluate(() =>
-    [...document.querySelectorAll("input, textarea, select")].map((el, index) => ({
-      index,
-      tag: el.tagName.toLowerCase(),
-      type: el.type || "",
-      name: el.name || "",
-      id: el.id || "",
-      label: el.labels?.[0]?.innerText?.trim() || "",
-      placeholder: el.placeholder || "",
-      autocomplete: el.autocomplete || "",
-      required: Boolean(el.required)
-    }))
-  );
+  return page.evaluate(() => [...document.querySelectorAll("input, textarea, select")].map((el, index) => ({
+    index,
+    tag: el.tagName.toLowerCase(),
+    type: el.type || "",
+    name: el.name || "",
+    id: el.id || "",
+    label: el.labels?.[0]?.innerText?.trim() || document.querySelector(`label[for="${CSS.escape(el.id || "")}"]`)?.innerText?.trim() || "",
+    placeholder: el.placeholder || "",
+    autocomplete: el.autocomplete || "",
+    required: Boolean(el.required)
+  })));
 }
 
-async function findApplyTarget(page) {
+async function findApplicationControl(page) {
   return page.evaluate(() => {
-    const candidates = [...document.querySelectorAll("a,button,[role='button']")];
-    return candidates.map((el, index) => ({
-      index,
-      tag: el.tagName.toLowerCase(),
-      text: (el.innerText || el.textContent || "").trim().replace(/\s+/g, " "),
-      href: el.href || ""
-    })).filter(x => /^(apply|apply now|application|start application)$/i.test(x.text) || /\bapply now\b/i.test(x.text));
+    const visible = el => {
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+    };
+    const text = el => (el.innerText || el.textContent || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+    const candidates = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")]
+      .filter(visible)
+      .map(el => ({
+        tag: el.tagName.toLowerCase(),
+        text: text(el),
+        href: el.href || "",
+        id: el.id || "",
+        cls: typeof el.className === "string" ? el.className : ""
+      }))
+      .filter(x => /apply\s*(now|for this job)?|application|submit application/i.test(x.text));
+    return candidates[0] || null;
   });
+}
+
+async function clickApplicationControl(page) {
+  const control = await findApplicationControl(page);
+  if (!control) return null;
+
+  console.log("🔘 Application control:", control.text, control.href || "(click)");
+
+  if (control.href && !/^javascript:/i.test(control.href)) {
+    return control.href;
+  }
+
+  const before = page.url();
+  await page.evaluate(() => {
+    const visible = el => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+    const els = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")];
+    const el = els.find(x => visible(x) && /apply\s*(now|for this job)?|application|submit application/i.test((x.innerText || x.textContent || x.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim()));
+    if (el) el.click();
+  });
+
+  await new Promise(resolve => setTimeout(resolve, 2500));
+  if (page.url() !== before) return page.url();
+
+  const pages = await page.browser().pages();
+  const other = pages.find(p => p !== page && p.url() !== "about:blank" && p.url() !== before);
+  return other ? other.url() : null;
 }
 
 async function main() {
@@ -60,9 +97,7 @@ async function main() {
     console.log("No verified eligible job is ready for application preparation.");
     return;
   }
-  if (!process.env.BROWSERBASE_API_KEY || !process.env.BROWSERBASE_PROJECT_ID) {
-    throw new Error("BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID are required");
-  }
+  if (!process.env.BROWSERBASE_API_KEY || !process.env.BROWSERBASE_PROJECT_ID) throw new Error("BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID are required");
 
   console.log("\n📝 PREPARING APPLICATION\n");
   console.log("Company:", candidate.company);
@@ -76,49 +111,34 @@ async function main() {
 
   try {
     await page.goto(candidate.official_url, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(resolve => setTimeout(resolve, 2500));
 
     let applicationUrl = page.url();
+    let applicationPage = page;
     let fields = await inspectFields(page);
 
     if (!fields.length) {
-      const targets = await findApplyTarget(page);
-      const target = targets.find(x => x.href && !/^javascript:/i.test(x.href));
-
-      if (target) {
-        console.log("🔗 Application portal found:", target.href);
-        await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await new Promise(r => setTimeout(r, 2500));
-        applicationUrl = page.url();
-        fields = await inspectFields(page);
-      } else {
-        const clickable = targets.find(x => !x.href);
-        if (clickable) {
-          console.log("🖱️ Clicking application control:", clickable.text);
-          const controls = await page.$$("a,button,[role='button']");
-          if (controls[clickable.index]) {
-            await controls[clickable.index].click();
-            await new Promise(r => setTimeout(r, 3000));
-            applicationUrl = page.url();
-            fields = await inspectFields(page);
-          }
-        }
+      const href = await clickApplicationControl(page);
+      if (href && href !== page.url()) {
+        console.log("🔗 Application portal:", href);
+        applicationPage = await browser.newPage();
+        await applicationPage.goto(href, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await new Promise(resolve => setTimeout(resolve, 2500));
       }
+      applicationUrl = applicationPage.url();
+      fields = await inspectFields(applicationPage);
     }
 
     const draft = [];
     const unknownRequired = [];
     for (const field of fields) {
       const value = valueForField(field);
-      const blocked = /password|otp|verification|captcha|resume|cover letter/i.test(fieldKey(field));
-      if (value && !blocked && field.tag !== "select") {
-        draft.push({ ...field, action: "prepared", value });
-      } else if (field.required && !value) {
+      const sensitiveOrUnknown = /password|otp|verification|captcha|resume|cover letter/i.test(fieldKey(field));
+      if (value && !sensitiveOrUnknown && field.tag !== "select") draft.push({ ...field, action: "prepared", value });
+      else if (field.required && !value) {
         unknownRequired.push(field);
         draft.push({ ...field, action: "needs_user_input" });
-      } else {
-        draft.push({ ...field, action: "left_unchanged" });
-      }
+      } else draft.push({ ...field, action: "left_unchanged" });
     }
 
     const result = {
@@ -131,8 +151,8 @@ async function main() {
       unknown_required_fields: unknownRequired,
       final_submission: "NOT PERFORMED"
     };
-
     fs.writeFileSync("./application-draft.json", JSON.stringify(result, null, 2));
+
     console.log(`\n📋 Application URL: ${applicationUrl}`);
     console.log(`✅ Known fields prepared: ${draft.filter(x => x.action === "prepared").length}`);
     console.log(`⚠️ Unknown required fields: ${unknownRequired.length}`);
