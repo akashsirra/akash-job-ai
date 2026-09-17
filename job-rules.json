@@ -9,9 +9,7 @@
     "accept_fresher": true,
     "accept_entry_level": true
   },
-  "employment": [
-    "full-time"
-  ],
+  "employment": ["full-time"],
   "target_roles": [
     "Software Engineer",
     "Software Developer",
@@ -24,18 +22,8 @@
     "Software Engineer Trainee"
   ],
   "preferred_skills": [
-    "Python",
-    "JavaScript",
-    "TypeScript",
-    "React",
-    "Next.js",
-    "Node.js",
-    "Express",
-    "REST APIs",
-    "PostgreSQL",
-    "SQLite",
-    "Git",
-    "GitHub"
+    "Python", "JavaScript", "TypeScript", "React", "Next.js", "Node.js",
+    "Express", "REST APIs", "PostgreSQL", "SQLite", "Git", "GitHub"
   ],
   "reject_if": [
     "requires more than 1 year experience",
@@ -55,6 +43,8 @@
     { "name": "Meesho", "ats": "lever", "slug": "meesho" },
     { "name": "Dun & Bradstreet", "ats": "lever", "slug": "dnb" },
     { "name": "Zeta", "ats": "lever", "slug": "zeta" },
-    { "name": "CRED", "ats": "lever", "slug": "cred" }
+    { "name": "CRED", "ats": "lever", "slug": "cred" },
+    { "name": "PlayPower Labs", "ats": "ashby", "slug": "playpowerlabs" },
+    { "name": "Zapier", "ats": "ashby", "slug": "zapier" }
   ]
 }
