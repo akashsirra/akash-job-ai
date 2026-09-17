@@ -1,0 +1,25 @@
+{
+  "name": "YOUR NAME",
+  "location": "Bangalore, India",
+  "phone": "YOUR PHONE",
+  "email": "YOUR EMAIL",
+  "portfolio": "YOUR PORTFOLIO",
+  "linkedin": "YOUR LINKEDIN",
+  "github": "YOUR GITHUB",
+  "education": {
+    "degree": "Bachelor of Technology in Computer Science and Engineering",
+    "university": "YOUR UNIVERSITY",
+    "graduation_year": 2024,
+    "gpa": "YOUR GPA"
+  },
+  "skills": {
+    "languages": ["Python", "JavaScript", "TypeScript", "SQL"],
+    "backend": ["Node.js", "Express", "REST APIs", "Socket.io"],
+    "frontend": ["React", "Next.js", "Vite", "Tailwind CSS"],
+    "databases_auth": ["PostgreSQL", "SQLite", "JSON", "Firebase", "JWT", "bcrypt"],
+    "testing_quality": ["API Testing", "Debugging", "Root Cause Analysis", "Regression Testing", "Input Validation", "Exception Handling"],
+    "tools": ["Git", "GitHub", "Vercel", "Termux", "PWA / Web Push"],
+    "ai": ["Groq", "AI SDK", "Firebase Auth"]
+  },
+  "projects": ["ForgeAI", "Flashcall", "DAMN Messaging", "Termux DevKit"]
+}
