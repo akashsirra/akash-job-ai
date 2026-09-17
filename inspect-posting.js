@@ -15,6 +15,13 @@ function unwrapUrl(value) {
   }
 }
 
+function extractVisibleUrl(text) {
+  const matches = String(text || "").match(/https?:\/\/[^\s<>"')]+/gi) || [];
+  return matches
+    .map(value => value.replace(/[.,;]+$/, ""))
+    .find(value => /myworkdayjobs\.com|f5\.com/i.test(value)) || null;
+}
+
 function isLikelyOfficial(url, company) {
   try {
     const host = new URL(unwrapUrl(url)).hostname.toLowerCase();
@@ -75,15 +82,21 @@ async function getGoogleResults(page) {
 }
 
 async function resolveSearchResult(page, result) {
+  // Google often puts the real destination in the visible result text while
+  // the anchor href is an opaque /goto?url=CAES... redirect token.
+  const visibleUrl = extractVisibleUrl(result.text);
+  if (visibleUrl && isLikelyOfficial(visibleUrl, "F5 Inc.")) return visibleUrl;
+
   const href = unwrapUrl(result.href);
   try {
     const host = new URL(href).hostname;
     if (!/google\.com$/i.test(host)) return href;
     await page.goto(href, { waitUntil: "domcontentloaded", timeout: 30000 });
     await new Promise(resolve => setTimeout(resolve, 800));
-    return page.url();
+    const resolved = page.url();
+    return extractVisibleUrl(result.text) || resolved;
   } catch {
-    return href;
+    return visibleUrl || href;
   }
 }
 
@@ -142,8 +155,6 @@ async function findOfficialApplication(page, job, data) {
     });
 
     for (const result of likely.slice(0, 8)) {
-      // Google may expose an opaque /goto?url=CAES... link. Do not apply
-      // the official-domain test until that redirect has actually resolved.
       const resolved = await resolveSearchResult(page, result);
       console.log("↪️ Search result:", result.text.slice(0, 100));
       console.log("   →", resolved);
