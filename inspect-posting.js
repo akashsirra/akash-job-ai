@@ -4,9 +4,20 @@ const fs = require("fs");
 const puppeteer = require("puppeteer-core");
 const Browserbase = require("@browserbasehq/sdk");
 
+function unwrapUrl(value) {
+  try {
+    const url = new URL(value);
+    if (!/google\.com$/i.test(url.hostname)) return url.href;
+    const target = url.searchParams.get("url") || url.searchParams.get("q");
+    return target ? decodeURIComponent(target) : url.href;
+  } catch {
+    return value;
+  }
+}
+
 function isLikelyOfficial(url, company) {
   try {
-    const host = new URL(url).hostname.toLowerCase();
+    const host = new URL(unwrapUrl(url)).hostname.toLowerCase();
     const compact = String(company || "")
       .toLowerCase()
       .replace(/[^a-z0-9]/g, "");
@@ -45,6 +56,17 @@ function relevantSearchResult(result, job) {
   );
 }
 
+async function getGoogleResults(page) {
+  return page.evaluate(() =>
+    [...document.querySelectorAll("a")]
+      .map(a => ({
+        text: (a.innerText || "").trim().replace(/\s+/g, " "),
+        href: a.href
+      }))
+      .filter(x => x.text && x.href && !/google\.com\/search/i.test(x.href))
+  );
+}
+
 async function discoverPostingUrl(page, job) {
   const query = `"${job.title}" "${job.company}" ${job.location || ""}`;
   const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
@@ -56,25 +78,18 @@ async function discoverPostingUrl(page, job) {
   });
   await new Promise(resolve => setTimeout(resolve, 1200));
 
-  const results = await page.evaluate(() =>
-    [...document.querySelectorAll("a")]
-      .map(a => ({
-        text: (a.innerText || "").trim().replace(/\s+/g, " "),
-        href: a.href
-      }))
-      .filter(x => x.text && x.href && !/google\.com\/search/i.test(x.href))
-  );
-
+  const results = await getGoogleResults(page);
   const match = results.find(result => relevantSearchResult(result, job));
   if (!match) return null;
 
-  console.log("🔗 Discovered posting:", match.href);
-  return match.href;
+  const resolved = unwrapUrl(match.href);
+  console.log("🔗 Discovered posting:", resolved);
+  return resolved;
 }
 
 async function findOfficialApplication(page, job, data) {
   const candidates = data.links
-    .map(link => ({ ...link, href: String(link.href || "").trim() }))
+    .map(link => ({ ...link, href: unwrapUrl(String(link.href || "").trim()) }))
     .filter(link => /^https?:\/\//i.test(link.href))
     .filter(link => !/google\.com|unstop\.com/i.test(new URL(link.href).hostname));
 
@@ -87,31 +102,33 @@ async function findOfficialApplication(page, job, data) {
   const official = candidates.find(link => isLikelyOfficial(link.href, job.company));
   if (official) return official.href;
 
-  const searchQuery = `"${job.title}" "${job.company}" official careers`;
-  const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}`;
-  console.log("🔎 No official application link exposed; searching for the official/ATS posting in the same session...");
+  const queries = [
+    `site:f5.com "${job.title}" Hyderabad`,
+    `site:myworkdayjobs.com "${job.title}" "${job.company}"`,
+    `"${job.title}" "${job.company}" official careers`
+  ];
 
-  await page.goto(searchUrl, {
-    waitUntil: "domcontentloaded",
-    timeout: 60000
-  });
-  await new Promise(resolve => setTimeout(resolve, 1200));
+  console.log("🔎 No official application link exposed; searching official company/ATS results in the same session...");
 
-  const results = await page.evaluate(() =>
-    [...document.querySelectorAll("a")]
-      .map(a => ({
-        text: (a.innerText || "").trim().replace(/\s+/g, " "),
-        href: a.href
-      }))
-      .filter(x => x.text && x.href && !/google\.com\/search/i.test(x.href))
-  );
+  for (const query of queries) {
+    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+    await page.goto(searchUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000
+    });
+    await new Promise(resolve => setTimeout(resolve, 1000));
 
-  const match = results.find(result =>
-    isLikelyOfficial(result.href, job.company) &&
-    /apply|application|careers|job|engineer|apprentice/i.test(`${result.text} ${result.href}`)
-  ) || results.find(result => isLikelyOfficial(result.href, job.company));
+    const results = await getGoogleResults(page);
+    const match = results.find(result => {
+      const href = unwrapUrl(result.href);
+      return isLikelyOfficial(href, job.company) &&
+        /apply|application|careers|job|engineer|apprentice/i.test(`${result.text} ${href}`);
+    }) || results.find(result => isLikelyOfficial(unwrapUrl(result.href), job.company));
 
-  return match ? match.href : null;
+    if (match) return unwrapUrl(match.href);
+  }
+
+  return null;
 }
 
 async function main() {
