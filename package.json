@@ -9,6 +9,7 @@
     "verify": "node inspect-posting.js",
     "match": "node matcher.js",
     "prepare": "node prepare-application.js",
+    "mark-applied": "node mark-applied.js",
     "pipeline": "node pipeline.js",
     "test": "node test.js"
   },
