@@ -1,136 +1,19 @@
 require("dotenv").config();
-const fs = require("fs");
-
-const BASE = process.env.FREEBROWSER_URL || "http://127.0.0.1:8765";
-const QUEUE_FILE = "./job-queue.json";
-const SOCIAL_HOSTS = /(^|\.)((instagram|facebook|youtube|youtu|tiktok|x|twitter|linkedin)\.com)$/i;
-const ATS_HOSTS = /(^|\.)(myworkdayjobs\.com|greenhouse\.io|lever\.co|ashbyhq\.com|icims\.com|smartrecruiters\.com|workday\.com)$/i;
-const CLOSED_PATTERNS = [
-  /this job is no longer available/i,
-  /job is no longer available/i,
-  /this position is no longer available/i,
-  /position is no longer available/i,
-  /job has been filled/i,
-  /position has been filled/i,
-  /applications? (?:are|is) (?:now )?closed/i,
-  /applications? (?:are|is) no longer being accepted/i,
-  /no longer accepting applications/i,
-  /job has expired/i,
-  /job posting has expired/i,
-  /requisition (?:has )?closed/i,
-  /posting (?:has )?closed/i
-];
-
-function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function normalize(value) { return String(value || "").toLowerCase().replace(/\s+/g, " ").trim(); }
-function unwrapUrl(value) {
-  try {
-    const u = new URL(String(value));
-    if (/google\.[^/]+$/i.test(u.hostname)) {
-      const target = u.searchParams.get("url") || u.searchParams.get("q");
-      return target ? decodeURIComponent(target) : u.href;
-    }
-    return u.href;
-  } catch { return String(value || ""); }
-}
-function hostname(url) { try { return new URL(unwrapUrl(url)).hostname.toLowerCase(); } catch { return ""; } }
-function isSocial(url) { return SOCIAL_HOSTS.test(hostname(url)); }
-function isLikelyOfficial(url, company) {
-  const host = hostname(url);
-  if (!host || isSocial(url)) return false;
-  const compact = normalize(company).replace(/[^a-z0-9]/g, "");
-  const first = normalize(company).split(/\s+/)[0].replace(/[^a-z0-9]/g, "");
-  return (compact && host.includes(compact)) || (first.length >= 2 && host.includes(first)) || ATS_HOSTS.test(host) || /(^|\.)careers?\.|(^|\.)jobs?\./i.test(host);
-}
-function isClosed(text) { return CLOSED_PATTERNS.some(pattern => pattern.test(String(text || ""))); }
-
-async function api(path, method = "GET", body) {
-  const response = await fetch(`${BASE}${path}`, {
-    method,
-    headers: body === undefined ? {} : { "content-type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body)
-  });
-  const raw = await response.text();
-  let data;
-  try { data = JSON.parse(raw); } catch { throw new Error(`FreeBrowser returned non-JSON from ${path}: ${raw.slice(0, 300)}`); }
-  if (!response.ok || data.ok === false) throw new Error(data.error || `FreeBrowser ${response.status} on ${path}`);
-  return data;
-}
-async function evaluate(script) {
-  const data = await api("/evaluate", "POST", { script });
-  try { return JSON.parse(data.result); } catch { return data.result; }
-}
-async function pageSnapshot() {
-  return evaluate(`(() => ({url:location.href,title:document.title,text:(document.body?.innerText||"").slice(0,30000),links:[...document.querySelectorAll("a")].map(a=>({text:(a.innerText||a.textContent||a.getAttribute("aria-label")||"").replace(/\\s+/g," ").trim(),href:a.href||""})).filter(x=>x.text&&x.href)}))()`);
-}
-function scoreResult(result, job) {
-  if (isSocial(result.href)) return -1000;
-  const text = normalize(`${result.text} ${result.href}`);
-  let score = 0;
-  const company = normalize(job.company);
-  if (company && text.includes(company)) score += 20;
-  if (isLikelyOfficial(result.href, job.company)) score += 15;
-  if (ATS_HOSTS.test(hostname(result.href))) score += 10;
-  for (const word of normalize(job.title).split(/[^a-z0-9]+/).filter(x => x.length >= 4)) if (text.includes(word)) score += 2;
-  if (/apply|careers|job|engineer|apprentice|requisition/i.test(text)) score += 1;
-  return score;
-}
-async function discoverPostingUrl(job) {
-  const query = `"${job.title}" "${job.company}" ${job.location || ""}`;
-  await api("/navigate", "POST", {url:`https://www.google.com/search?q=${encodeURIComponent(query)}`});
-  await sleep(1800);
-  const data = await pageSnapshot();
-  const ranked = data.links.map(link=>({...link,href:unwrapUrl(link.href)}))
-    .filter(link=>/^https?:\/\//i.test(link.href)&&!/^google\./i.test(hostname(link.href))&&!isSocial(link.href))
-    .map(r=>({r,score:scoreResult(r,job)})).filter(x=>x.score>0).sort((a,b)=>b.score-a.score);
-  return ranked[0]?.r.href || null;
-}
-async function findOfficialApplication(job, data) {
-  const candidates = (data.links||[]).map(link=>({...link,href:unwrapUrl(link.href)}))
-    .filter(link=>/^https?:\/\//i.test(link.href)&&!isSocial(link.href)&&!/^google\./i.test(hostname(link.href)));
-  const direct = candidates.find(link=>/apply|application|careers|job details|view job/i.test(link.text)&&isLikelyOfficial(link.href,job.company));
-  if (direct) return direct.href;
-  const official = candidates.find(link=>isLikelyOfficial(link.href,job.company));
-  if (official) return official.href;
-  const query=`"${job.title}" "${job.company}" ${job.location||""} official careers apply`;
-  await api("/navigate","POST",{url:`https://www.google.com/search?q=${encodeURIComponent(query)}`});
-  await sleep(1500);
-  const search=await pageSnapshot();
-  return search.links.map(link=>({...link,href:unwrapUrl(link.href)}))
-    .filter(link=>/^https?:\/\//i.test(link.href)&&!isSocial(link.href)&&!/^google\./i.test(hostname(link.href)))
-    .map(r=>({r,score:scoreResult(r,job)})).filter(x=>x.score>0).sort((a,b)=>b.score-a.score)
-    .find(x=>isLikelyOfficial(x.r.href,job.company))?.r.href || null;
-}
-async function main() {
-  if (!fs.existsSync(QUEUE_FILE)) throw new Error("No job queue found.");
-  const queue=JSON.parse(fs.readFileSync(QUEUE_FILE,"utf8"));
-  const index=queue.findIndex(job=>job.status!=="verified"&&job.status!=="closed"&&job.application_status!=="applied");
-  if(index===-1){console.log("No unverified job is waiting.");return;}
-  const job=queue[index];
-  console.log("\n🤖 VERIFYING ONE JOB\n");
-  console.log("Title:",job.title); console.log("Company:",job.company);
-  console.log("Posting URL:",job.posting_url||"not stored — discovery will run in FreeBrowser");
-  const status=await api("/status");
-  console.log(`🌐 FreeBrowser: ${status.browserAttached?"connected":"not attached"}`);
-  if(!status.browserAttached) throw new Error("FreeBrowser browser is not attached. Open FreeBrowser first.");
-
-  let postingUrl=job.posting_url||null;
-  if(isSocial(postingUrl)) postingUrl=null;
-  if(!postingUrl) postingUrl=await discoverPostingUrl(job);
-  if(!postingUrl||isSocial(postingUrl)) {
-    queue[index]={...job,status:"needs_review",verification_error:"No valid employer/ATS posting URL found; social-media URLs are rejected"};
-    fs.writeFileSync(QUEUE_FILE,JSON.stringify(queue,null,2));
-    console.log("⚠️ No valid employer/ATS posting URL found."); return;
-  }
-  await api("/navigate","POST",{url:postingUrl}); await sleep(2500);
-  const data=await pageSnapshot();
-  const closed=isClosed(data.text);
-  const officialUrl=closed?null:await findOfficialApplication(job,data);
-  const resolvedOfficial=officialUrl||job.official_url||null;
-  queue[index]={...job,posting_url:postingUrl,source_url:postingUrl,resolved_url:data.url,page_title:data.title,description:data.text,official_url:resolvedOfficial,status:closed?"closed":(resolvedOfficial?"verified":"needs_review"),verified_at:new Date().toISOString(),...(closed?{verification_error:"Job posting is closed or no longer accepting applications"}:resolvedOfficial?{}:{verification_error:"Official application URL not identified"})};
-  fs.writeFileSync(QUEUE_FILE,JSON.stringify(queue,null,2));
-  console.log("\n🌐 FINAL URL:\n"+data.url); console.log("\n📄 PAGE TITLE:\n"+data.title); console.log("\n🔗 OFFICIAL APPLICATION:\n"+(resolvedOfficial||"Not identified"));
-  console.log(`\n${closed?"🚫 Job is closed.":resolvedOfficial?"✅ Job verified.":"⚠️ Needs review."}`);
-  console.log("💾 Saved verification to job-queue.json"); console.log("\n✅ Posting inspection complete.\nFreeBrowser sessions used: 0 cloud sessions");
-}
-main().catch(error=>{console.error("\n❌ ERROR:",error.message);process.exit(1);});
+const fs=require("fs");
+const BASE=process.env.FREEBROWSER_URL||"http://127.0.0.1:8765";
+const QUEUE_FILE="./job-queue.json";
+const SOCIAL=/^((www|m)\.)?(instagram|facebook|youtube|youtu|tiktok|twitter|x|linkedin)\.com$/i;
+const ATS=/(^|\.)(myworkdayjobs\.com|greenhouse\.io|lever\.co|ashbyhq\.com|icims\.com|smartrecruiters\.com|workday\.com)$/i;
+const CLOSED=[/no longer available/i,/no longer accepting applications/i,/applications? (?:are|is) (?:now )?closed/i,/job has been filled/i,/position has been filled/i,/job (?:posting )?has expired/i,/requisition (?:has )?closed/i];
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function host(v){try{return new URL(v).hostname.toLowerCase()}catch{return""}}
+function clean(v){try{const u=new URL(String(v));if(/^google\./i.test(u.hostname)){const t=u.searchParams.get("url")||u.searchParams.get("q");return t?decodeURIComponent(t):u.href}return u.href}catch{return""}}
+function social(v){return SOCIAL.test(host(clean(v)))}
+function official(v,company){const h=host(clean(v));if(!h||social(v))return false;const c=String(company||"").toLowerCase().replace(/[^a-z0-9]/g,"");const f=String(company||"").toLowerCase().split(/\s+/)[0].replace(/[^a-z0-9]/g,"");return ATS.test(h)||/(^|\.)careers?\.|(^|\.)jobs?\./i.test(h)||(c&&h.includes(c))||(f.length>2&&h.includes(f))}
+async function api(path,method="GET",body){const r=await fetch(`${BASE}${path}`,{method,headers:body?{"content-type":"application/json"}:{},body:body?JSON.stringify(body):undefined});const t=await r.text();let d;try{d=JSON.parse(t)}catch{throw Error(`FreeBrowser returned non-JSON from ${path}`)}if(!r.ok||d.ok===false)throw Error(d.error||`FreeBrowser ${r.status}`);return d}
+async function evalJS(s){const d=await api("/evaluate","POST",{script:s});try{return JSON.parse(d.result)}catch{return d.result}}
+async function snap(){return evalJS(`(()=>({url:location.href,title:document.title,text:(document.body?.innerText||"").slice(0,30000),links:[...document.querySelectorAll("a")].map(a=>({text:(a.innerText||a.textContent||a.getAttribute("aria-label")||"").replace(/\\s+/g," ").trim(),href:a.href||""})).filter(x=>x.text&&x.href)}))()`)}
+function score(x,j){if(social(x.href))return -10000;const t=`${x.text} ${x.href}`.toLowerCase();let s=0;if(t.includes(String(j.company).toLowerCase()))s+=30;if(official(x.href,j.company))s+=25;if(ATS.test(host(x.href)))s+=20;for(const w of String(j.title).toLowerCase().split(/[^a-z0-9]+/).filter(x=>x.length>3))if(t.includes(w))s+=2;return s}
+async function search(j,q){await api("/navigate","POST",{url:`https://www.google.com/search?q=${encodeURIComponent(q)}`});await sleep(1800);const d=await snap();return d.links.map(x=>({...x,href:clean(x.href)})).filter(x=>/^https?:/i.test(x.href)&&!/^google\./i.test(host(x.href))&&!social(x.href)).map(x=>({x,s:score(x,j)})).filter(x=>x.s>0).sort((a,b)=>b.s-a.s).map(x=>x.x)}
+async function main(){const q=JSON.parse(fs.readFileSync(QUEUE_FILE,"utf8"));const i=q.findIndex(j=>j.status!=="verified"&&j.status!=="closed"&&j.application_status!=="applied");if(i<0){console.log("No unverified job is waiting.");return}const j=q[i];console.log("\n🤖 VERIFYING ONE JOB\n\nTitle:",j.title,"\nCompany:",j.company,"\nPosting URL:",j.posting_url||"not stored — discovery will run in FreeBrowser");const st=await api("/status");console.log(`🌐 FreeBrowser: ${st.browserAttached?"connected":"not attached"}`);if(!st.browserAttached)throw Error("FreeBrowser browser is not attached. Open FreeBrowser first.");let url=social(j.posting_url)?null:j.posting_url;if(!url){const r=await search(j,`"${j.title}" "${j.company}" ${j.location||""}`);url=r[0]?.href||null}if(!url||social(url)){q[i]={...j,status:"needs_review",verification_error:"No valid employer/ATS posting URL found"};fs.writeFileSync(QUEUE_FILE,JSON.stringify(q,null,2));console.log("⚠️ No valid employer/ATS posting URL found.");return}await api("/navigate","POST",{url});await sleep(2500);const d=await snap();const closed=CLOSED.some(r=>r.test(d.text));let app=null;if(!closed){const direct=d.links.map(x=>({...x,href:clean(x.href)})).filter(x=>!social(x.href)&&official(x.href,j.company));app=direct.find(x=>/apply|application|careers|job details|view job/i.test(x.text))?.href||direct[0]?.href||null}if(!app&&!closed){const r=await search(j,`"${j.title}" "${j.company}" ${j.location||""} official careers apply`);app=r.find(x=>official(x.href,j.company))?.href||null}q[i]={...j,posting_url:url,resolved_url:d.url,page_title:d.title,description:d.text,official_url:app||j.official_url||null,status:closed?"closed":(app||j.official_url?"verified":"needs_review"),verified_at:new Date().toISOString(),verification_error:closed?"Job posting is closed or no longer accepting applications":(app||j.official_url?undefined:"Official application URL not identified")};if(!q[i].verification_error)delete q[i].verification_error;fs.writeFileSync(QUEUE_FILE,JSON.stringify(q,null,2));console.log("\n🌐 FINAL URL:\n"+d.url+"\n\n📄 PAGE TITLE:\n"+d.title+"\n\n🔗 OFFICIAL APPLICATION:\n"+(app||j.official_url||"Not identified")+`\n\n${closed?"🚫 Job is closed.":app||j.official_url?"✅ Job verified.":"⚠️ Needs review."}\n💾 Saved verification to job-queue.json\n\n✅ Posting inspection complete.\nFreeBrowser sessions used: 0 cloud sessions`)}
+main().catch(e=>{console.error("\n❌ ERROR:",e.message);process.exit(1)})
