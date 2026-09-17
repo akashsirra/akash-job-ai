@@ -72,9 +72,51 @@ async function discoverPostingUrl(page, job) {
   return match.href;
 }
 
+async function findOfficialApplication(page, job, data) {
+  const candidates = data.links
+    .map(link => ({ ...link, href: String(link.href || "").trim() }))
+    .filter(link => /^https?:\/\//i.test(link.href))
+    .filter(link => !/google\.com|unstop\.com/i.test(new URL(link.href).hostname));
+
+  const direct = candidates.find(link =>
+    /apply|application|submit|careers|job details|view job/i.test(link.text) &&
+    isLikelyOfficial(link.href, job.company)
+  );
+  if (direct) return direct.href;
+
+  const official = candidates.find(link => isLikelyOfficial(link.href, job.company));
+  if (official) return official.href;
+
+  const searchQuery = `"${job.title}" "${job.company}" official careers`;
+  const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}`;
+  console.log("🔎 No official application link exposed; searching for the official/ATS posting in the same session...");
+
+  await page.goto(searchUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
+  await new Promise(resolve => setTimeout(resolve, 1200));
+
+  const results = await page.evaluate(() =>
+    [...document.querySelectorAll("a")]
+      .map(a => ({
+        text: (a.innerText || "").trim().replace(/\s+/g, " "),
+        href: a.href
+      }))
+      .filter(x => x.text && x.href && !/google\.com\/search/i.test(x.href))
+  );
+
+  const match = results.find(result =>
+    isLikelyOfficial(result.href, job.company) &&
+    /apply|application|careers|job|engineer|apprentice/i.test(`${result.text} ${result.href}`)
+  ) || results.find(result => isLikelyOfficial(result.href, job.company));
+
+  return match ? match.href : null;
+}
+
 async function main() {
   const queue = JSON.parse(fs.readFileSync("./job-queue.json", "utf8"));
-  const index = queue.findIndex(job => job.status !== "verified");
+  const index = queue.findIndex(job => job.status !== "verified" && job.application_status !== "applied");
 
   if (index === -1) {
     console.log("No unverified job is waiting.");
@@ -131,30 +173,27 @@ async function main() {
         .filter(x => x.text && x.href)
     }));
 
-    const official = data.links.find(link =>
-      /apply|official|careers|job details|view job/i.test(link.text) &&
-      isLikelyOfficial(link.href, job.company)
-    ) || data.links.find(link => isLikelyOfficial(link.href, job.company));
-
-    const officialUrl = official ? official.href :
-      (isLikelyOfficial(data.url, job.company) ? data.url : job.official_url);
+    const officialUrl = await findOfficialApplication(page, job, data);
 
     queue[index] = {
       ...job,
       posting_url: postingUrl,
+      source_url: postingUrl,
       resolved_url: data.url,
       page_title: data.title,
       description: data.text,
-      official_url: officialUrl,
-      status: officialUrl ? "verified" : "needs_review",
-      verified_at: new Date().toISOString()
+      official_url: officialUrl || job.official_url || null,
+      status: officialUrl || job.official_url ? "verified" : "needs_review",
+      verified_at: new Date().toISOString(),
+      verification_error: officialUrl || job.official_url ? undefined : "Official application URL not identified"
     };
 
+    if (!queue[index].verification_error) delete queue[index].verification_error;
     fs.writeFileSync("./job-queue.json", JSON.stringify(queue, null, 2));
 
     console.log("\n🌐 FINAL URL:\n" + data.url);
     console.log("\n📄 PAGE TITLE:\n" + data.title);
-    console.log("\n🔗 OFFICIAL APPLICATION:\n" + (officialUrl || "Not identified"));
+    console.log("\n🔗 OFFICIAL APPLICATION:\n" + (officialUrl || job.official_url || "Not identified"));
     console.log("\n💾 Saved verification to job-queue.json");
   } finally {
     await browser.close();
