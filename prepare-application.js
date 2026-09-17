@@ -120,13 +120,21 @@ async function clickApply(page) {
   return null;
 }
 
-function eightfoldJobUrl(officialUrl) {
+function eightfoldJobUrl(job) {
   try {
-    const u = new URL(officialUrl);
+    const u = new URL(job.official_url);
     const m = u.pathname.match(/\/job\/(\d+)/i);
     if (!m) return null;
-    // Qualcomm's searchable Eightfold route preserves the job id in pid.
-    return `https://app.eightfold.ai/careers?pid=${m[1]}&domain=qualcomm.com&sort_by=relevance&triggerGoButton=false`;
+
+    // Qualcomm's public Eightfold links use query + pid together.
+    const params = new URLSearchParams({
+      query: job.title || "",
+      pid: m[1],
+      domain: "qualcomm.com",
+      sort_by: "relevance",
+      triggerGoButton: "false"
+    });
+    return `https://app.eightfold.ai/careers?${params.toString()}`;
   } catch {
     return null;
   }
@@ -158,7 +166,7 @@ async function main() {
   let page = await browser.newPage();
 
   try {
-    const eightfoldUrl = eightfoldJobUrl(candidate.official_url);
+    const eightfoldUrl = eightfoldJobUrl(candidate);
     const startUrl = eightfoldUrl || candidate.official_url;
     if (eightfoldUrl) console.log("↪️ Qualcomm Eightfold job search route:", eightfoldUrl);
 
@@ -188,10 +196,8 @@ async function main() {
       fields = await inspectFields(page);
     }
 
-    // Do not mistake Eightfold's search/filter controls for an application form.
     const body = await page.evaluate(() => document.body.innerText.slice(0, 12000)).catch(() => "");
-    const genericSearch = /app\.eightfold\.ai\/careers\?/i.test(applicationUrl) &&
-      !/apply now/i.test(body);
+    const genericSearch = /app\.eightfold\.ai\/careers\?/i.test(applicationUrl) && !/apply now/i.test(body);
     if (genericSearch) fields = [];
 
     const draft = [];
