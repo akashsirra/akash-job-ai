@@ -1,165 +1,185 @@
 require("dotenv").config();
-
 const fs = require("fs");
-const puppeteer = require("puppeteer-core");
-const Browserbase = require("@browserbasehq/sdk");
 
+const BASE = process.env.FREEBROWSER_URL || "http://127.0.0.1:8765";
+const QUEUE_FILE = "./job-queue.json";
+
+const CLOSED_PATTERNS = [
+  /this job is no longer available/i,
+  /job is no longer available/i,
+  /this position is no longer available/i,
+  /position is no longer available/i,
+  /job has been filled/i,
+  /position has been filled/i,
+  /applications? (?:are|is) (?:now )?closed/i,
+  /applications? (?:are|is) no longer being accepted/i,
+  /no longer accepting applications/i,
+  /job has expired/i,
+  /job posting has expired/i,
+  /requisition (?:has )?closed/i,
+  /posting (?:has )?closed/i
+];
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function normalize(value) { return String(value || "").toLowerCase().replace(/\s+/g, " ").trim(); }
 function unwrapUrl(value) {
   try {
-    const url = new URL(value);
-    if (!/google\.com$/i.test(url.hostname)) return url.href;
-    const target = url.searchParams.get("url") || url.searchParams.get("q");
-    return target ? decodeURIComponent(target) : url.href;
-  } catch {
-    return value;
-  }
+    const u = new URL(String(value));
+    if (!/google\.[^/]+$/i.test(u.hostname)) return u.href;
+    const target = u.searchParams.get("url") || u.searchParams.get("q");
+    return target ? decodeURIComponent(target) : u.href;
+  } catch { return String(value || ""); }
 }
-
-function extractVisibleUrl(text) {
-  const matches = String(text || "").match(/https?:\/\/[^\s<>"')]+/gi) || [];
-  return matches.map(value => value.replace(/[.,;]+$/, ""))
-    .find(value => /myworkdayjobs\.com|f5\.com/i.test(value)) || null;
-}
-
-function extractRequisition(text) {
-  const match = String(text || "").match(/\b(RP\d{6,})\b/i);
-  return match ? match[1].toUpperCase() : null;
-}
-
+function isClosed(text) { return CLOSED_PATTERNS.some(pattern => pattern.test(String(text || ""))); }
 function isLikelyOfficial(url, company) {
   try {
     const host = new URL(unwrapUrl(url)).hostname.toLowerCase();
-    const compact = String(company || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-    const firstToken = String(company || "").toLowerCase().split(/\s+/)[0].replace(/[^a-z0-9]/g, "");
-    if (compact && host.includes(compact)) return true;
-    if (firstToken && firstToken.length >= 2 && host.includes(firstToken)) return true;
-    return /(^|\.)myworkdayjobs\.com$/i.test(host) || /(^|\.)greenhouse\.io$/i.test(host) ||
-      /(^|\.)lever\.co$/i.test(host) || /(^|\.)ashbyhq\.com$/i.test(host) ||
-      /(^|\.)icims\.com$/i.test(host) || /(^|\.)smartrecruiters\.com$/i.test(host) ||
-      /(^|\.)workday\.com$/i.test(host) || /(^|\.)careers?\./i.test(host) || /(^|\.)jobs?\./i.test(host);
+    const compact = normalize(company).replace(/[^a-z0-9]/g, "");
+    const first = normalize(company).split(/\s+/)[0].replace(/[^a-z0-9]/g, "");
+    return (compact && host.includes(compact)) || (first.length >= 2 && host.includes(first)) ||
+      /(^|\.)myworkdayjobs\.com$|(^|\.)greenhouse\.io$|(^|\.)lever\.co$|(^|\.)ashbyhq\.com$|(^|\.)icims\.com$|(^|\.)smartrecruiters\.com$|(^|\.)workday\.com$|(^|\.)careers?\.|(^|\.)jobs?\./i.test(host);
   } catch { return false; }
 }
 
-function normalize(value) {
-  return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+async function api(path, method = "GET", body) {
+  const response = await fetch(`${BASE}${path}`, {
+    method,
+    headers: body === undefined ? {} : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  const raw = await response.text();
+  let data;
+  try { data = JSON.parse(raw); } catch { throw new Error(`FreeBrowser returned non-JSON from ${path}: ${raw.slice(0, 300)}`); }
+  if (!response.ok || data.ok === false) throw new Error(data.error || `FreeBrowser ${response.status} on ${path}`);
+  return data;
 }
 
-function relevantSearchResult(result, job) {
+async function evaluate(script) {
+  const data = await api("/evaluate", "POST", { script });
+  let result = data.result;
+  try { return JSON.parse(result); } catch { return result; }
+}
+
+async function pageSnapshot() {
+  return evaluate(`(() => ({
+    url: location.href,
+    title: document.title,
+    text: (document.body?.innerText || "").slice(0, 30000),
+    links: [...document.querySelectorAll("a")].map(a => ({
+      text: (a.innerText || a.textContent || a.getAttribute("aria-label") || "").replace(/\\s+/g, " ").trim(),
+      href: a.href || ""
+    })).filter(x => x.text && x.href)
+  }))()`);
+}
+
+function scoreResult(result, job) {
   const text = normalize(`${result.text} ${result.href}`);
-  const titleWords = normalize(job.title).split(/[^a-z0-9]+/)
-    .filter(word => word.length >= 4 && !["software", "engineer", "apprentice"].includes(word));
-  return text.includes(normalize(job.company)) || text.includes("f5.com") ||
-    text.includes("rp1038677") || titleWords.some(word => text.includes(word));
-}
-
-async function getGoogleResults(page) {
-  return page.evaluate(() => [...document.querySelectorAll("a")].map(a => ({
-    text: (a.innerText || "").trim().replace(/\s+/g, " "), href: a.href
-  })).filter(x => x.text && x.href && !/google\.com\/search/i.test(x.href)));
-}
-
-function buildKnownWorkdayUrl(result, job) {
-  const text = `${result.text || ""} ${result.href || ""}`;
-  const requisition = extractRequisition(text);
-  if (/f5/i.test(job.company) && (requisition === "RP1038677" || /software engineer apprentice/i.test(text))) {
-    return "https://ffive.wd5.myworkdayjobs.com/f5jobs/job/Hyderabad/Software-Engineer-Apprentice_RP1038677";
+  let score = 0;
+  const company = normalize(job.company);
+  if (company && text.includes(company)) score += 10;
+  if (isLikelyOfficial(result.href, job.company)) score += 8;
+  for (const word of normalize(job.title).split(/[^a-z0-9]+/).filter(x => x.length >= 4)) {
+    if (text.includes(word)) score += 2;
   }
-  return null;
+  if (/apply|careers|job|engineer|apprentice|requisition/i.test(text)) score += 1;
+  return score;
 }
 
-async function resolveSearchResult(page, result, job) {
-  const knownWorkday = buildKnownWorkdayUrl(result, job);
-  if (knownWorkday) return knownWorkday;
-  const visibleUrl = extractVisibleUrl(result.text);
-  if (visibleUrl && isLikelyOfficial(visibleUrl, job.company)) return visibleUrl;
-  const href = unwrapUrl(result.href);
-  try {
-    const host = new URL(href).hostname;
-    if (!/google\.com$/i.test(host)) return href;
-    await page.goto(href, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await new Promise(resolve => setTimeout(resolve, 800));
-    return extractVisibleUrl(result.text) || page.url();
-  } catch { return visibleUrl || href; }
-}
-
-async function discoverPostingUrl(page, job) {
+async function discoverPostingUrl(job) {
   const query = `"${job.title}" "${job.company}" ${job.location || ""}`;
-  await page.goto(`https://www.google.com/search?q=${encodeURIComponent(query)}`, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await new Promise(resolve => setTimeout(resolve, 1200));
-  const results = await getGoogleResults(page);
-  const match = results.find(result => relevantSearchResult(result, job));
-  return match ? resolveSearchResult(page, match, job) : null;
+  await api("/navigate", "POST", { url: `https://www.google.com/search?q=${encodeURIComponent(query)}` });
+  await sleep(1800);
+  const data = await pageSnapshot();
+  const results = data.links
+    .map(link => ({ ...link, href: unwrapUrl(link.href) }))
+    .filter(link => /^https?:\/\//i.test(link.href) && !/google\.[^/]+$/i.test(new URL(link.href).hostname));
+  const ranked = results.map(r => ({ r, score: scoreResult(r, job) })).sort((a, b) => b.score - a.score);
+  const best = ranked[0]?.r;
+  return best?.href || null;
 }
 
-async function findOfficialApplication(page, job, data) {
-  const candidates = data.links.map(link => ({ ...link, href: unwrapUrl(String(link.href || "").trim()) }))
+async function findOfficialApplication(job, postingUrl, data) {
+  const candidates = (data.links || [])
+    .map(link => ({ ...link, href: unwrapUrl(link.href) }))
     .filter(link => /^https?:\/\//i.test(link.href))
-    .filter(link => !/google\.com|unstop\.com/i.test(new URL(link.href).hostname));
-  const direct = candidates.find(link => /apply|application|submit|careers|job details|view job/i.test(link.text) && isLikelyOfficial(link.href, job.company));
+    .filter(link => !/google\.[^/]+$|unstop\.com$/i.test(new URL(link.href).hostname));
+  const direct = candidates.find(link => /apply|application|careers|job details|view job/i.test(link.text) && isLikelyOfficial(link.href, job.company));
   if (direct) return direct.href;
   const official = candidates.find(link => isLikelyOfficial(link.href, job.company));
   if (official) return official.href;
 
-  const queries = [
-    `site:myworkdayjobs.com "RP1038677"`,
-    `site:myworkdayjobs.com "Software Engineer Apprentice" "F5" Hyderabad`,
-    `site:f5.com "RP1038677"`,
-    `site:f5.com "Software Engineer Apprentice" Hyderabad`,
-    `"Software Engineer Apprentice" "F5 Inc." "RP1038677" official careers`
-  ];
-  console.log("🔎 No official application link exposed; resolving official/ATS search results in the same session...");
-  for (const query of queries) {
-    await page.goto(`https://www.google.com/search?q=${encodeURIComponent(query)}`, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    const results = await getGoogleResults(page);
-    const likely = results.filter(result => {
-      const text = normalize(`${result.text} ${result.href}`);
-      return /apply|application|careers|job|engineer|apprentice|rp1038677/i.test(text) || /myworkdayjobs\.com|f5\.com/i.test(text);
-    });
-    for (const result of likely.slice(0, 8)) {
-      const resolved = await resolveSearchResult(page, result, job);
-      console.log("↪️ Search result:", result.text.slice(0, 100));
-      console.log("   →", resolved);
-      if (isLikelyOfficial(resolved, job.company) && /rp1038677|software-engineer-apprentice|f5jobs/i.test(resolved)) return resolved;
-    }
-  }
-  return null;
+  const query = `"${job.title}" "${job.company}" ${job.location || ""} official careers apply`;
+  await api("/navigate", "POST", { url: `https://www.google.com/search?q=${encodeURIComponent(query)}` });
+  await sleep(1500);
+  const search = await pageSnapshot();
+  const match = search.links
+    .map(link => ({ ...link, href: unwrapUrl(link.href) }))
+    .filter(link => /^https?:\/\//i.test(link.href))
+    .filter(link => !/google\.[^/]+$/i.test(new URL(link.href).hostname))
+    .sort((a, b) => scoreResult(b, job) - scoreResult(a, job))
+    .find(link => isLikelyOfficial(link.href, job.company));
+  return match?.href || null;
 }
 
 async function main() {
-  const queue = JSON.parse(fs.readFileSync("./job-queue.json", "utf8"));
-  const index = queue.findIndex(job => job.status !== "verified" && job.application_status !== "applied");
-  if (index === -1) { console.log("No unverified job is waiting."); return; }
+  if (!fs.existsSync(QUEUE_FILE)) throw new Error("No job queue found.");
+  const queue = JSON.parse(fs.readFileSync(QUEUE_FILE, "utf8"));
+  const index = queue.findIndex(job => job.status !== "verified" && job.status !== "closed" && job.application_status !== "applied");
+  if (index === -1) {
+    console.log("No unverified job is waiting.");
+    return;
+  }
+
   const job = queue[index];
   console.log("\n🤖 VERIFYING ONE JOB\n");
-  console.log("Title:", job.title); console.log("Company:", job.company); console.log("Posting URL:", job.posting_url || "not stored — discovery will run inside this verification session");
-  if (!process.env.BROWSERBASE_API_KEY || !process.env.BROWSERBASE_PROJECT_ID) throw new Error("BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID are required");
-  const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
-  const session = await bb.sessions.create({ projectId: process.env.BROWSERBASE_PROJECT_ID });
-  console.log("☁️ Browserbase session created");
-  const browser = await puppeteer.connect({ browserWSEndpoint: session.connectUrl });
-  const page = await browser.newPage();
-  try {
-    let postingUrl = job.posting_url;
-    if (/f5/i.test(job.company) && /Software Engineer Apprentice/i.test(job.title)) postingUrl = "https://ffive.wd5.myworkdayjobs.com/f5jobs/job/Hyderabad/Software-Engineer-Apprentice_RP1038677";
-    else if (!postingUrl) postingUrl = await discoverPostingUrl(page, job);
-    if (!postingUrl) {
-      queue[index] = { ...job, status: "needs_review", verification_error: "Could not discover a posting URL" };
-      fs.writeFileSync("./job-queue.json", JSON.stringify(queue, null, 2)); return;
-    }
-    await page.goto(postingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    const data = await page.evaluate(() => ({
-      url: location.href, title: document.title, text: document.body.innerText.slice(0, 20000),
-      links: [...document.querySelectorAll("a")].map(a => ({ text: (a.innerText || "").trim(), href: a.href })).filter(x => x.text && x.href)
-    }));
-    const officialUrl = await findOfficialApplication(page, job, data);
-    const closed = /this job is no longer available|job is no longer available|this position is no longer available|position is no longer available|job has been filled|position has been filled|applications? (?:are|is) (?:now )?closed|no longer accepting applications|job has expired|job posting has expired|requisition (?:has )?closed|posting (?:has )?closed/i.test(data.text);
-    queue[index] = { ...job, posting_url: postingUrl, source_url: postingUrl, resolved_url: data.url, page_title: data.title, description: data.text, official_url: officialUrl || job.official_url || null, status: closed ? "closed" : (officialUrl || job.official_url ? "verified" : "needs_review"), verified_at: new Date().toISOString(), verification_error: closed ? "Job posting is closed or no longer accepting applications" : (officialUrl || job.official_url ? undefined : "Official application URL not identified") };
-    if (!queue[index].verification_error) delete queue[index].verification_error;
-    fs.writeFileSync("./job-queue.json", JSON.stringify(queue, null, 2));
-    console.log("\n🌐 FINAL URL:\n" + data.url); console.log("\n📄 PAGE TITLE:\n" + data.title); console.log("\n🔗 OFFICIAL APPLICATION:\n" + (officialUrl || job.official_url || "Not identified")); console.log("\n💾 Saved verification to job-queue.json");
-  } finally { await browser.close(); }
-  console.log("\n✅ Posting inspection complete.\nBrowserbase sessions used: 1");
+  console.log("Title:", job.title);
+  console.log("Company:", job.company);
+  console.log("Posting URL:", job.posting_url || "not stored — discovery will run in FreeBrowser");
+
+  const status = await api("/status");
+  console.log(`🌐 FreeBrowser: ${status.browserAttached ? "connected" : "not attached"}`);
+  if (!status.browserAttached) throw new Error("FreeBrowser browser is not attached. Open FreeBrowser first.");
+
+  let postingUrl = job.posting_url || null;
+  if (!postingUrl) postingUrl = await discoverPostingUrl(job);
+  if (!postingUrl) {
+    queue[index] = { ...job, status: "needs_review", verification_error: "Could not discover a posting URL using FreeBrowser" };
+    fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue, null, 2));
+    console.log("⚠️ Could not discover a posting URL.");
+    return;
+  }
+
+  await api("/navigate", "POST", { url: postingUrl });
+  await sleep(2500);
+  const data = await pageSnapshot();
+  const closed = isClosed(data.text);
+  const officialUrl = closed ? null : await findOfficialApplication(job, postingUrl, data);
+  const resolvedOfficial = officialUrl || job.official_url || null;
+
+  queue[index] = {
+    ...job,
+    posting_url: postingUrl,
+    source_url: postingUrl,
+    resolved_url: data.url,
+    page_title: data.title,
+    description: data.text,
+    official_url: resolvedOfficial,
+    status: closed ? "closed" : (resolvedOfficial ? "verified" : "needs_review"),
+    verified_at: new Date().toISOString(),
+    ...(closed ? { verification_error: "Job posting is closed or no longer accepting applications" } :
+      resolvedOfficial ? {} : { verification_error: "Official application URL not identified" })
+  };
+  fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue, null, 2));
+
+  console.log("\n🌐 FINAL URL:\n" + data.url);
+  console.log("\n📄 PAGE TITLE:\n" + data.title);
+  console.log("\n🔗 OFFICIAL APPLICATION:\n" + (resolvedOfficial || "Not identified"));
+  console.log(`\n${closed ? "🚫 Job is closed." : resolvedOfficial ? "✅ Job verified." : "⚠️ Needs review."}`);
+  console.log("💾 Saved verification to job-queue.json");
+  console.log("\n✅ Posting inspection complete.\nFreeBrowser sessions used: 0 cloud sessions");
 }
-main().catch(error => { console.error("\n❌ ERROR:", error.message); process.exit(1); });
+
+main().catch(error => {
+  console.error("\n❌ ERROR:", error.message);
+  process.exit(1);
+});
