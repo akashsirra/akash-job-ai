@@ -55,6 +55,7 @@
 
   function setValue(el, value) {
     if (el.readOnly || el.disabled) return false;
+    if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return false;
     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
     if (setter) setter.call(el, String(value)); else el.value = String(value);
@@ -121,8 +122,34 @@
       const f = fields[message.index];
       if (!f) return Promise.resolve({ ok: false, error: "Field no longer exists" });
       const els = [...document.querySelectorAll("input, textarea, select")].filter(el => visible(el) && !el.disabled);
+      if (sensitive.test(f.label + " " + f.name + " " + f.id)) return Promise.resolve({ ok: false, error: "Sensitive field blocked" });
       return Promise.resolve({ ok: setValue(els[message.index], message.value) });
     }
     return false;
   });
+
+  // Tell the background script whenever a new document or SPA route is ready.
+  // This lets ApplyPilot refill the next application page after the candidate
+  // presses the site's own Next/Continue button, without submitting anything.
+  let lastReadyUrl = "";
+  function announcePage() {
+    if (location.href === lastReadyUrl) return;
+    lastReadyUrl = location.href;
+    api.runtime.sendMessage({ type: "PAGE_READY", url: location.href }).catch(() => {});
+  }
+  const originalPush = history.pushState;
+  history.pushState = function (...args) {
+    const result = originalPush.apply(this, args);
+    setTimeout(announcePage, 250);
+    return result;
+  };
+  const originalReplace = history.replaceState;
+  history.replaceState = function (...args) {
+    const result = originalReplace.apply(this, args);
+    setTimeout(announcePage, 250);
+    return result;
+  };
+  window.addEventListener("popstate", () => setTimeout(announcePage, 250));
+  window.addEventListener("hashchange", () => setTimeout(announcePage, 250));
+  setTimeout(announcePage, 300);
 })();
