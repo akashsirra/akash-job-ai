@@ -15,7 +15,6 @@ function fieldKey(field) {
 function valueForField(field) {
   const key = fieldKey(field);
   const parts = String(profile.name || "").trim().split(/\s+/);
-
   if (/first.*name|given.*name/.test(key)) return parts[0] || null;
   if (/last.*name|family.*name|surname/.test(key)) return parts.slice(1).join(" ") || null;
   if (/full.*name|your name/.test(key)) return profile.name || null;
@@ -24,40 +23,43 @@ function valueForField(field) {
   if (/linkedin/.test(key)) return profile.linkedin || null;
   if (/github/.test(key)) return profile.github || null;
   if (/portfolio|personal site|website/.test(key)) return profile.portfolio || null;
-
   return null;
 }
 
 async function inspectFields(page) {
   return page.evaluate(() =>
-    [...document.querySelectorAll("input, textarea, select")].map((el, index) => {
-      const label = el.labels?.[0]?.innerText?.trim() ||
-        document.querySelector(`label[for="${CSS.escape(el.id || "")}"]`)?.innerText?.trim() || "";
-      return {
-        index,
-        tag: el.tagName.toLowerCase(),
-        type: el.type || "",
-        name: el.name || "",
-        id: el.id || "",
-        label,
-        placeholder: el.placeholder || "",
-        autocomplete: el.autocomplete || "",
-        required: Boolean(el.required)
-      };
-    })
+    [...document.querySelectorAll("input, textarea, select")].map((el, index) => ({
+      index,
+      tag: el.tagName.toLowerCase(),
+      type: el.type || "",
+      name: el.name || "",
+      id: el.id || "",
+      label: el.labels?.[0]?.innerText?.trim() || "",
+      placeholder: el.placeholder || "",
+      autocomplete: el.autocomplete || "",
+      required: Boolean(el.required)
+    }))
   );
 }
 
-async function main() {
-  const candidate = queue.find(job =>
-    job.official_url && job.status === "verified" && matchJob(job).eligible
-  );
+async function findApplyTarget(page) {
+  return page.evaluate(() => {
+    const candidates = [...document.querySelectorAll("a,button,[role='button']")];
+    return candidates.map((el, index) => ({
+      index,
+      tag: el.tagName.toLowerCase(),
+      text: (el.innerText || el.textContent || "").trim().replace(/\s+/g, " "),
+      href: el.href || ""
+    })).filter(x => /^(apply|apply now|application|start application)$/i.test(x.text) || /\bapply now\b/i.test(x.text));
+  });
+}
 
+async function main() {
+  const candidate = queue.find(job => job.official_url && job.status === "verified" && matchJob(job).eligible);
   if (!candidate) {
     console.log("No verified eligible job is ready for application preparation.");
     return;
   }
-
   if (!process.env.BROWSERBASE_API_KEY || !process.env.BROWSERBASE_PROJECT_ID) {
     throw new Error("BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID are required");
   }
@@ -74,48 +76,42 @@ async function main() {
 
   try {
     await page.goto(candidate.official_url, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    await new Promise(r => setTimeout(r, 2000));
 
     let applicationUrl = page.url();
     let fields = await inspectFields(page);
 
-    // Career pages often contain only the job description. Find the real application portal.
     if (!fields.length) {
-      const applyLinks = await page.evaluate(() =>
-        [...document.querySelectorAll("a")]
-          .map(a => ({ text: (a.innerText || "").trim(), href: a.href }))
-          .filter(x => x.href && /apply|application|submit application/i.test(x.text))
-      );
+      const targets = await findApplyTarget(page);
+      const target = targets.find(x => x.href && !/^javascript:/i.test(x.href));
 
-      const applyLink = applyLinks.find(x => x.href && !/^javascript:/i.test(x.href));
-
-      if (applyLink) {
-        console.log("🔗 Application portal found:", applyLink.href);
-        const applicationPage = await browser.newPage();
-        try {
-          await applicationPage.goto(applyLink.href, {
-            waitUntil: "domcontentloaded",
-            timeout: 60000
-          });
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          applicationUrl = applicationPage.url();
-          fields = await inspectFields(applicationPage);
-          await applicationPage.close();
-        } catch (error) {
-          await applicationPage.close().catch(() => {});
-          console.log("⚠️ Could not open application portal:", error.message);
+      if (target) {
+        console.log("🔗 Application portal found:", target.href);
+        await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await new Promise(r => setTimeout(r, 2500));
+        applicationUrl = page.url();
+        fields = await inspectFields(page);
+      } else {
+        const clickable = targets.find(x => !x.href);
+        if (clickable) {
+          console.log("🖱️ Clicking application control:", clickable.text);
+          const controls = await page.$$("a,button,[role='button']");
+          if (controls[clickable.index]) {
+            await controls[clickable.index].click();
+            await new Promise(r => setTimeout(r, 3000));
+            applicationUrl = page.url();
+            fields = await inspectFields(page);
+          }
         }
       }
     }
 
     const draft = [];
     const unknownRequired = [];
-
     for (const field of fields) {
       const value = valueForField(field);
-      const sensitiveOrUnknown = /password|otp|verification|captcha|resume|cover letter/i.test(fieldKey(field));
-
-      if (value && !sensitiveOrUnknown && field.tag !== "select") {
+      const blocked = /password|otp|verification|captcha|resume|cover letter/i.test(fieldKey(field));
+      if (value && !blocked && field.tag !== "select") {
         draft.push({ ...field, action: "prepared", value });
       } else if (field.required && !value) {
         unknownRequired.push(field);
@@ -137,7 +133,6 @@ async function main() {
     };
 
     fs.writeFileSync("./application-draft.json", JSON.stringify(result, null, 2));
-
     console.log(`\n📋 Application URL: ${applicationUrl}`);
     console.log(`✅ Known fields prepared: ${draft.filter(x => x.action === "prepared").length}`);
     console.log(`⚠️ Unknown required fields: ${unknownRequired.length}`);
@@ -147,7 +142,6 @@ async function main() {
   } finally {
     await browser.close();
   }
-
   console.log("Browserbase sessions used: 1");
 }
 
