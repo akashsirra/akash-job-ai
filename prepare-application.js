@@ -74,6 +74,25 @@ function adapterUrl(url) {
   } catch { return null; }
 }
 
+async function isLivePosting(url) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    try {
+      const response = await fetch(url, { method: "HEAD", redirect: "follow", signal: controller.signal, headers: { "User-Agent": "AkashJobAI/1.0" } });
+      if (response.ok) return true;
+      if (![405, 403].includes(response.status)) return false;
+    } finally { clearTimeout(timer); }
+
+    const controller2 = new AbortController();
+    const timer2 = setTimeout(() => controller2.abort(), 12000);
+    try {
+      const response = await fetch(url, { method: "GET", redirect: "follow", signal: controller2.signal, headers: { "User-Agent": "AkashJobAI/1.0", Accept: "text/html,*/*" } });
+      return response.ok;
+    } finally { clearTimeout(timer2); }
+  } catch { return false; }
+}
+
 async function inspect(page) {
   for (const frame of page.frames()) {
     try {
@@ -135,14 +154,28 @@ async function fill(frame, fields) {
 async function main() {
   const arg = process.argv.slice(2).find(x => x.startsWith("--job="));
   const requested = arg ? arg.slice(6).toLowerCase() : null;
-  const candidates = queue.filter(j => j.official_url && j.status === "verified" && j.application_status !== "applied" && matchJob(j).eligible);
-  const candidate = requested ? candidates.find(j => `${j.company} ${j.title}`.toLowerCase().includes(requested)) : candidates[0];
-  if (!candidate) { console.log("No verified eligible job is ready for application preparation."); return; }
+  const ranked = queue
+    .filter(j => (j.posting_url || j.official_url) && j.application_status !== "applied" && j.status !== "rejected")
+    .map(j => ({ job: j, match: matchJob(j) }))
+    .filter(x => x.match.eligible)
+    .sort((a, b) => b.match.matchScore - a.match.matchScore);
+
+  let candidate = requested ? ranked.find(x => `${x.job.company} ${x.job.title}`.toLowerCase().includes(requested))?.job : null;
+  if (!candidate) {
+    for (const item of ranked) {
+      const url = item.job.posting_url || item.job.official_url;
+      console.log(`🔍 Preflight: ${item.job.company} | ${item.job.title}`);
+      if (await isLivePosting(url)) { candidate = item.job; break; }
+      console.log("   ⛔ Posting URL is not live; skipping without Browserbase.");
+    }
+  }
+  if (!candidate) { console.log("No live eligible job is ready for application preparation."); return; }
+  const startUrl = candidate.posting_url || candidate.official_url;
   if (!process.env.BROWSERBASE_API_KEY || !process.env.BROWSERBASE_PROJECT_ID) throw new Error("BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID are required");
 
   console.log("\n📝 PREPARING APPLICATION\n");
-  console.log("Company:", candidate.company); console.log("Role:", candidate.title); console.log("URL:", candidate.official_url);
-  console.log("🧩 Application adapter:", detectAdapter(candidate.official_url));
+  console.log("Company:", candidate.company); console.log("Role:", candidate.title); console.log("URL:", startUrl);
+  console.log("🧩 Application adapter:", detectAdapter(startUrl));
 
   const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
   const session = await bb.sessions.create({ projectId: process.env.BROWSERBASE_PROJECT_ID });
@@ -151,12 +184,12 @@ async function main() {
   const debug = await bb.sessions.debug(session.id).catch(() => null);
   const liveViewUrl = debug?.debuggerFullscreenUrl || debug?.debuggerUrl || null;
   const allFilled = [], allSkipped = [];
-  let applicationUrl = candidate.official_url;
+  let applicationUrl = startUrl;
 
   try {
-    await page.goto(candidate.official_url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(5000);
-    let target = adapterUrl(candidate.official_url);
+    let target = adapterUrl(startUrl);
     if (target) console.log("🧭 Direct application route:", target);
     if (!target) {
       const apply = await controls(page, APPLY_RE);
@@ -182,7 +215,6 @@ async function main() {
       if (final.found.length) { console.log("🛑 Final submission control detected:", final.found[0].text); break; }
       const next = await controls(page, NEXT_RE);
       if (!next.found.length) break;
-      const before = page.url();
       await next.frame.evaluate(text => {
         const visible = el => { const r = el.getBoundingClientRect(), s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden"; };
         const label = el => (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").replace(/\s+/g, " ").trim();
@@ -190,11 +222,10 @@ async function main() {
         if (el) el.click();
       }, next.found[0].text);
       await sleep(3000);
-      if (page.url() === before && step === 10) break;
     }
 
     const unknownRequired = allSkipped.filter(f => f.required);
-    fs.writeFileSync("application-draft.json", JSON.stringify({ prepared_at: new Date().toISOString(), company: candidate.company, title: candidate.title, official_url: candidate.official_url, application_url: applicationUrl, live_view_url: liveViewUrl, fields_filled: allFilled, fields_skipped: allSkipped, unknown_required_fields: unknownRequired, final_submission: "NOT PERFORMED" }, null, 2));
+    fs.writeFileSync("application-draft.json", JSON.stringify({ prepared_at: new Date().toISOString(), company: candidate.company, title: candidate.title, official_url: candidate.official_url || candidate.posting_url, application_url: applicationUrl, live_view_url: liveViewUrl, fields_filled: allFilled, fields_skipped: allSkipped, unknown_required_fields: unknownRequired, final_submission: "NOT PERFORMED" }, null, 2));
     console.log(`\n📋 Application URL: ${applicationUrl}`);
     console.log(`✅ Fields filled live: ${allFilled.length}`);
     console.log(`⚠️ Fields skipped: ${allSkipped.length} (of which required: ${unknownRequired.length})`);
