@@ -33,8 +33,10 @@ function hasFresherSignal(text) {
   return /\b(fresher|freshers|entry[- ]level|graduate|new grad|early career|trainee|campus|0\s*[-to]+\s*1\s*years?)\b/i.test(text);
 }
 
-function roleMatchesTitle(title) {
+function roleMatchesTitle(title, fullText = "") {
   const value = normalize(title);
+  const context = normalize(fullText);
+
   const patterns = [
     /\bsoftware\s+(?:engineer|developer)\b/i,
     /\bsoftware\s+development\s+engineer\b/i,
@@ -48,6 +50,14 @@ function roleMatchesTitle(title) {
 
   if (patterns.some(pattern => pattern.test(value))) return true;
 
+  // Some employers shorten the title to simply "Engineer" while the
+  // posting itself clearly identifies the work as software engineering.
+  if (/\bengineer\b/i.test(value) &&
+      /\bsoftware\s+(?:engineering|development|developer|engineer)\b/i.test(context) &&
+      hasFresherSignal(context)) {
+    return true;
+  }
+
   return (rules.target_roles || []).some(role => {
     const target = normalize(role);
     return value === target || value.startsWith(`${target} -`) || value.startsWith(`${target} |`);
@@ -58,8 +68,13 @@ function locationMatches(text) {
   const value = normalize(text);
   const allowed = (rules.locations || []).map(normalize);
 
-  if (allowed.includes("remote india") && /\bremote\b/.test(value) && /\bindia\b/.test(value)) {
-    return true;
+  if (allowed.includes("remote india")) {
+    // Queue entries can say "Remote India", "Anywhere", "WFH", or
+    // "Work from home" instead of literally saying "Remote India".
+    const remoteSignal = /\bremote\b|\bwfh\b|work\s+from\s+home|work[- ]from[- ]home/i.test(value);
+    const indiaSignal = /\bindia\b/i.test(value);
+    const anywhereSignal = /\banywhere\b/i.test(value);
+    if (remoteSignal && (indiaSignal || anywhereSignal)) return true;
   }
 
   if (allowed.includes("bangalore") && /\b(?:bangalore|bengaluru)\b/.test(value)) return true;
@@ -73,7 +88,7 @@ function explicitExperienceTooHigh(text, maxYears) {
   if (new RegExp(`\\b${maxYears + 1}\\s*[-+]?\\s*years?\\b`).test(value)) return true;
   if (/\b(?:2|3|4|5|6|7|8|9|10)\s*\+?\s*years?\b/i.test(value)) return true;
 
-  const range = value.match(/\b(\d+)\s*[-to]+\s*(\d+)\s*years?\b/i);
+  const range = value.match(/\b(\d+)\s*(?:-|to)\s*(\d+)\s*years?\b/i);
   if (range && Number(range[1]) > maxYears) return true;
 
   return false;
@@ -84,7 +99,7 @@ function matchJob(job) {
     `${job.title || ""} ${job.location || ""} ${job.description || ""} ${(job.source_context || []).join(" ")}`
   );
 
-  const roleMatch = roleMatchesTitle(job.title || "");
+  const roleMatch = roleMatchesTitle(job.title || "", text);
   const locationMatch = locationMatches(text);
 
   const rejected = (rules.reject_if || []).find(reason => {
@@ -148,7 +163,7 @@ function matchJob(job) {
   };
 }
 
-module.exports = { matchJob };
+module.exports = { matchJob, roleMatchesTitle, locationMatches };
 
 if (require.main === module) {
   const queue = JSON.parse(fs.readFileSync("./job-queue.json", "utf8"));
