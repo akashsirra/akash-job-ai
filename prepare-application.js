@@ -40,101 +40,70 @@ async function inspectFields(page) {
   })));
 }
 
-async function findApplicationControlInContext(context) {
-  return context.evaluate(() => {
+async function findApply(page) {
+  return page.evaluate(() => {
     const visible = el => {
       const r = el.getBoundingClientRect();
       const s = getComputedStyle(el);
       return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
     };
-    const text = el => (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").replace(/\s+/g, " ").trim();
-    const selector = "a,button,[role=button],input[type=button],input[type=submit]";
-    const candidates = [...document.querySelectorAll(selector)]
-      .filter(visible)
-      .map(el => ({
-        text: text(el),
-        href: el.href || "",
-        tag: el.tagName.toLowerCase()
-      }))
-      .filter(x => /^(apply|apply now|apply for this job|application|submit application)$/i.test(x.text) || /\bapply\b/i.test(x.text));
-    return candidates[0] || null;
+    const text = el => (el.innerText || el.textContent || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+    const nodes = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")];
+    const matches = nodes.filter(visible).map(el => ({
+      text: text(el),
+      href: el.href || "",
+      tag: el.tagName.toLowerCase()
+    })).filter(x => /^apply( now)?$/i.test(x.text) || /apply now|apply for this job/i.test(x.text));
+    return matches[0] || null;
   });
 }
 
-async function findApplicationControl(page) {
-  // Qualcomm/Eightfold can render the job UI inside a frame. Search every frame.
-  for (const frame of page.frames()) {
-    try {
-      const found = await findApplicationControlInContext(frame);
-      if (found) return { frame, ...found };
-    } catch {}
+async function clickApply(page) {
+  const apply = await findApply(page);
+  if (!apply) return null;
+  console.log("🔘 Apply control:", apply.text, apply.href || "(button)");
+
+  if (apply.href && !/^javascript:/i.test(apply.href)) return apply.href;
+
+  const before = page.url();
+  const popupPromise = new Promise(resolve => {
+    const timer = setTimeout(() => resolve(null), 5000);
+    page.browser().once("targetcreated", target => {
+      clearTimeout(timer);
+      resolve(target);
+    });
+  });
+
+  await page.evaluate(() => {
+    const nodes = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")];
+    const el = nodes.find(x => {
+      const r = x.getBoundingClientRect();
+      const t = (x.innerText || x.textContent || x.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      return r.width > 0 && r.height > 0 && (/^apply( now)?$/i.test(t) || /apply now|apply for this job/i.test(t));
+    });
+    if (el) el.click();
+  });
+
+  await new Promise(resolve => setTimeout(resolve, 2500));
+  if (page.url() !== before) return page.url();
+
+  const target = await popupPromise;
+  if (target) {
+    const popup = await target.page().catch(() => null);
+    if (popup) return popup;
   }
   return null;
 }
 
-async function clickApplicationControl(page) {
-  const control = await findApplicationControl(page);
-  if (!control) return null;
-
-  console.log("🔘 Application control:", control.text, control.href || "(click)");
-
-  if (control.href && !/^javascript:/i.test(control.href)) return control.href;
-
-  const before = page.url();
-  const beforePages = new Set(await page.browser().pages());
-
+function eightfoldJobUrl(officialUrl) {
   try {
-    await control.frame.evaluate(() => {
-      const visible = el => {
-        const r = el.getBoundingClientRect();
-        const s = getComputedStyle(el);
-        return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
-      };
-      const text = el => (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").replace(/\s+/g, " ").trim();
-      const el = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")]
-        .find(x => visible(x) && /\bapply\b/i.test(text(x)));
-      if (el) el.click();
-    });
-  } catch {}
-
-  await new Promise(resolve => setTimeout(resolve, 3000));
-
-  if (page.url() !== before) return page.url();
-
-  const pages = await page.browser().pages();
-  const popup = pages.find(p => !beforePages.has(p) && p.url() !== "about:blank");
-  return popup ? popup.url() : null;
-}
-
-function eightfoldFallbackUrl(officialUrl) {
-  try {
-    const parsed = new URL(officialUrl);
-    const match = parsed.pathname.match(/\/job\/(\d+)/i);
-    if (!match) return null;
-    const parts = parsed.hostname.split(".");
-    const domain = parts.length >= 2 ? parts.slice(-2).join(".") : parsed.hostname;
-    return `https://app.eightfold.ai/careers?pid=${match[1]}&domain=${encodeURIComponent(domain)}&sort_by=relevance&triggerGoButton=false`;
+    const u = new URL(officialUrl);
+    const m = u.pathname.match(/\/job\/(\d+)/i);
+    if (!m) return null;
+    return `https://qualcomm.eightfold.ai/careers/job/${m[1]}`;
   } catch {
     return null;
   }
-}
-
-async function prepareFromPage(page) {
-  let fields = await inspectFields(page);
-  if (fields.length) return { page, fields };
-
-  const href = await clickApplicationControl(page);
-  if (href && href !== page.url()) {
-    console.log("🔗 Application portal:", href);
-    const applicationPage = await page.browser().newPage();
-    await applicationPage.goto(href, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    fields = await inspectFields(applicationPage);
-    if (fields.length) return { page: applicationPage, fields };
-    return { page: applicationPage, fields };
-  }
-
-  return { page, fields };
 }
 
 async function main() {
@@ -153,37 +122,47 @@ async function main() {
   const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
   const session = await bb.sessions.create({ projectId: process.env.BROWSERBASE_PROJECT_ID });
   const browser = await puppeteer.connect({ browserWSEndpoint: session.connectUrl });
-  let applicationPage = null;
+  let page = await browser.newPage();
 
   try {
-    const page = await browser.newPage();
-    await page.goto(candidate.official_url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    const directEightfold = eightfoldJobUrl(candidate.official_url);
+    if (directEightfold) {
+      console.log("↪️ Direct Qualcomm Eightfold job route:", directEightfold);
+      await page.goto(directEightfold, { waitUntil: "domcontentloaded", timeout: 60000 });
+    } else {
+      await page.goto(candidate.official_url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    }
     await new Promise(resolve => setTimeout(resolve, 3000));
 
-    let result = await prepareFromPage(page);
-    applicationPage = result.page;
-    let fields = result.fields;
+    let applicationUrl = page.url();
+    let fields = await inspectFields(page);
+    let applyTarget = await clickApply(page);
 
-    // Qualcomm's current careers site is powered by Eightfold. If its Apply control
-    // is not exposed on the public career page, use the corresponding Eightfold job
-    // route in the SAME Browserbase session and inspect it there.
-    if (!fields.length) {
-      const fallback = eightfoldFallbackUrl(candidate.official_url);
-      if (fallback) {
-        console.log("↪️ Eightfold job route:", fallback);
-        const eightfoldPage = await browser.newPage();
-        await eightfoldPage.goto(fallback, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await new Promise(resolve => setTimeout(resolve, 4000));
-        result = await prepareFromPage(eightfoldPage);
-        applicationPage = result.page;
-        fields = result.fields;
+    if (applyTarget) {
+      if (typeof applyTarget === "string") {
+        console.log("🔗 Application portal:", applyTarget);
+        const next = await browser.newPage();
+        await next.goto(applyTarget, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        page = next;
+      } else {
+        page = applyTarget;
       }
+      applicationUrl = page.url();
+      fields = await inspectFields(page);
     }
 
-    const applicationUrl = applicationPage.url();
+    // Never treat generic Eightfold search/filter inputs as an application form.
+    const genericSearchPage = /app\.eightfold\.ai\/careers\?(?!.*\/job)/i.test(applicationUrl) ||
+      /search for job title|search for location/i.test((await page.title().catch(() => "")) + " " + (await page.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => "")));
+
+    if (genericSearchPage) {
+      console.log("⚠️ Reached generic Eightfold search page; not treating its fields as application fields.");
+      fields = [];
+    }
+
     const draft = [];
     const unknownRequired = [];
-
     for (const field of fields) {
       const value = valueForField(field);
       const sensitiveOrUnknown = /password|otp|verification|captcha|resume|cover letter/i.test(fieldKey(field));
@@ -194,7 +173,7 @@ async function main() {
       } else draft.push({ ...field, action: "left_unchanged" });
     }
 
-    const resultFile = {
+    const result = {
       prepared_at: new Date().toISOString(),
       company: candidate.company,
       title: candidate.title,
@@ -204,12 +183,12 @@ async function main() {
       unknown_required_fields: unknownRequired,
       final_submission: "NOT PERFORMED"
     };
-    fs.writeFileSync("./application-draft.json", JSON.stringify(resultFile, null, 2));
+    fs.writeFileSync("./application-draft.json", JSON.stringify(result, null, 2));
 
     console.log(`\n📋 Application URL: ${applicationUrl}`);
     console.log(`✅ Known fields prepared: ${draft.filter(x => x.action === "prepared").length}`);
     console.log(`⚠️ Unknown required fields: ${unknownRequired.length}`);
-    console.log(`🔎 Form fields detected: ${fields.length}`);
+    console.log(`🔎 Application form fields detected: ${fields.length}`);
     console.log("💾 Saved application-draft.json");
     console.log("🛑 Final submission was NOT performed.");
   } finally {
