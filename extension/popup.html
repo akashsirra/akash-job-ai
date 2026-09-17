@@ -7,27 +7,18 @@
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; }
     body { margin:0; min-width:320px; background:#0b1020; color:#eef2ff; }
-    main { padding:16px; }
-    h1 { margin:0 0 4px; font-size:22px; }
-    .muted { color:#9aa6c1; font-size:12px; }
+    main { padding:16px; } h1 { margin:0 0 4px; font-size:22px; } .muted { color:#9aa6c1; font-size:12px; }
     button { width:100%; border:0; border-radius:10px; padding:12px; margin-top:10px; font-weight:700; cursor:pointer; background:#6d5dfc; color:white; }
-    button.secondary { background:#202a44; }
-    textarea,input { width:100%; box-sizing:border-box; margin-top:8px; border:1px solid #303b59; border-radius:8px; background:#11182b; color:white; padding:10px; }
-    .card { margin-top:12px; padding:12px; border:1px solid #26314d; border-radius:12px; background:#10172a; }
-    #status { margin-top:12px; font-size:13px; white-space:pre-wrap; }
-    .count { font-size:28px; font-weight:800; }
+    button.secondary { background:#202a44; } .card { margin-top:12px; padding:12px; border:1px solid #26314d; border-radius:12px; background:#10172a; }
+    #status { margin-top:12px; font-size:13px; white-space:pre-wrap; } .count { font-size:28px; font-weight:800; }
   </style>
 </head>
-<body>
-<main>
-  <h1>ApplyPilot 🚀</h1>
-  <div class="muted">AI-assisted job application helper</div>
+<body><main>
+  <h1>ApplyPilot 🚀</h1><div class="muted">AI-assisted job application helper</div>
   <div class="card"><div class="count" id="count">—</div><div class="muted">fields detected</div></div>
   <button id="scan">Scan application</button>
   <button id="fill" class="secondary">Fill known fields</button>
+  <button id="aiFill" class="secondary">AI-fill open questions</button>
   <button id="settings" class="secondary">Settings / Groq key</button>
   <div id="status">Ready.</div>
-</main>
-<script src="popup.js"></script>
-</body>
-</html>
+</main><script src="popup.js"></script></body></html>
