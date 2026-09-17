@@ -7,8 +7,8 @@ const Browserbase = require("@browserbasehq/sdk");
 function unwrapUrl(value) {
   try {
     const url = new URL(value);
-    if (!/google\.[^/]+$/i.test(url.hostname)) return url.href;
-    const target = url.searchParams.get("url") || url.searchParams.get("q") || url.searchParams.get("uddg");
+    if (!/google\.com$/i.test(url.hostname)) return url.href;
+    const target = url.searchParams.get("url") || url.searchParams.get("q");
     return target ? decodeURIComponent(target) : url.href;
   } catch {
     return value;
@@ -29,16 +29,15 @@ function isLikelyOfficial(url, company) {
     if (compact && host.includes(compact)) return true;
     if (firstToken && firstToken.length >= 2 && host.includes(firstToken)) return true;
 
-    // ATS platforms commonly use company-specific subdomains, e.g. f5.wd5.myworkdayjobs.com.
-    if (/(^|\.)myworkdayjobs\.com$/i.test(host)) return true;
-    if (/(^|\.)greenhouse\.io$/i.test(host)) return true;
-    if (/(^|\.)lever\.co$/i.test(host)) return true;
-    if (/(^|\.)ashbyhq\.com$/i.test(host)) return true;
-    if (/(^|\.)icims\.com$/i.test(host)) return true;
-    if (/(^|\.)smartrecruiters\.com$/i.test(host)) return true;
-    if (/(^|\.)workday\.com$/i.test(host)) return true;
-
-    return /(^|\.)((careers?|jobs?)\.[a-z0-9.-]+)$/i.test(host);
+    return /(^|\.)myworkdayjobs\.com$/i.test(host) ||
+      /(^|\.)greenhouse\.io$/i.test(host) ||
+      /(^|\.)lever\.co$/i.test(host) ||
+      /(^|\.)ashbyhq\.com$/i.test(host) ||
+      /(^|\.)icims\.com$/i.test(host) ||
+      /(^|\.)smartrecruiters\.com$/i.test(host) ||
+      /(^|\.)workday\.com$/i.test(host) ||
+      /(^|\.)careers?\./i.test(host) ||
+      /(^|\.)jobs?\./i.test(host);
   } catch {
     return false;
   }
@@ -59,6 +58,7 @@ function relevantSearchResult(result, job) {
   return (
     text.includes(company) ||
     text.includes("f5.com") ||
+    text.includes("rp1038677") ||
     titleWords.some(word => text.includes(word))
   );
 }
@@ -74,22 +74,32 @@ async function getGoogleResults(page) {
   );
 }
 
+async function resolveSearchResult(page, result) {
+  const href = unwrapUrl(result.href);
+  if (!/google\.com$/i.test(new URL(href).hostname)) return href;
+
+  try {
+    await page.goto(href, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await new Promise(resolve => setTimeout(resolve, 800));
+    return page.url();
+  } catch {
+    return href;
+  }
+}
+
 async function discoverPostingUrl(page, job) {
   const query = `"${job.title}" "${job.company}" ${job.location || ""}`;
   const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
 
   console.log("🔎 No posting URL stored; searching for the posting...");
-  await page.goto(searchUrl, {
-    waitUntil: "domcontentloaded",
-    timeout: 60000
-  });
+  await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
   await new Promise(resolve => setTimeout(resolve, 1200));
 
   const results = await getGoogleResults(page);
   const match = results.find(result => relevantSearchResult(result, job));
   if (!match) return null;
 
-  const resolved = unwrapUrl(match.href);
+  const resolved = await resolveSearchResult(page, match);
   console.log("🔗 Discovered posting:", resolved);
   return resolved;
 }
@@ -109,34 +119,35 @@ async function findOfficialApplication(page, job, data) {
   const official = candidates.find(link => isLikelyOfficial(link.href, job.company));
   if (official) return official.href;
 
-  // Search several precise forms. All searches reuse the SAME Browserbase page/session.
   const queries = [
-    `site:myworkdayjobs.com "${job.title}" "RP1038677"`,
-    `site:myworkdayjobs.com "${job.title}" "${job.company}" Hyderabad`,
-    `site:f5.com "${job.title}" "RP1038677"`,
-    `site:f5.com "${job.title}" Hyderabad`,
-    `"${job.title}" "${job.company}" "RP1038677" official careers`
+    `site:myworkdayjobs.com "RP1038677"`,
+    `site:myworkdayjobs.com "Software Engineer Apprentice" "F5" Hyderabad`,
+    `site:f5.com "RP1038677"`,
+    `site:f5.com "Software Engineer Apprentice" Hyderabad`,
+    `"Software Engineer Apprentice" "F5 Inc." "RP1038677" official careers`
   ];
 
-  console.log("🔎 No official application link exposed; searching official company/ATS results in the same session...");
+  console.log("🔎 No official application link exposed; resolving official/ATS search results in the same session...");
 
   for (const query of queries) {
     const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
-    await page.goto(searchUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000
-    });
-    await new Promise(resolve => setTimeout(resolve, 900));
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await new Promise(resolve => setTimeout(resolve, 1000));
 
     const results = await getGoogleResults(page);
-    const matches = results
-      .map(result => ({ ...result, href: unwrapUrl(result.href) }))
-      .filter(result => isLikelyOfficial(result.href, job.company))
-      .filter(result => /apply|application|careers|job|engineer|apprentice|RP1038677/i.test(`${result.text} ${result.href}`));
+    const likely = results.filter(result => {
+      const text = normalize(`${result.text} ${result.href}`);
+      return isLikelyOfficial(result.href, job.company) &&
+        (/apply|application|careers|job|engineer|apprentice|rp1038677/i.test(text) || /myworkdayjobs\.com/i.test(text));
+    });
 
-    if (matches.length) {
-      console.log("🔗 Official/ATS candidate:", matches[0].href);
-      return matches[0].href;
+    for (const result of likely.slice(0, 5)) {
+      const resolved = await resolveSearchResult(page, result);
+      if (isLikelyOfficial(resolved, job.company) &&
+          /rp1038677|software-engineer-apprentice|f5jobs/i.test(resolved)) {
+        console.log("🎯 Official/ATS result resolved:", resolved);
+        return resolved;
+      }
     }
   }
 
@@ -163,34 +174,23 @@ async function main() {
   }
 
   const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
-  const session = await bb.sessions.create({
-    projectId: process.env.BROWSERBASE_PROJECT_ID
-  });
+  const session = await bb.sessions.create({ projectId: process.env.BROWSERBASE_PROJECT_ID });
   console.log("☁️ Browserbase session created");
 
-  const browser = await puppeteer.connect({
-    browserWSEndpoint: session.connectUrl
-  });
+  const browser = await puppeteer.connect({ browserWSEndpoint: session.connectUrl });
   const page = await browser.newPage();
 
   try {
     const postingUrl = job.posting_url || await discoverPostingUrl(page, job);
 
     if (!postingUrl) {
-      queue[index] = {
-        ...job,
-        status: "needs_review",
-        verification_error: "Could not discover a posting URL"
-      };
+      queue[index] = { ...job, status: "needs_review", verification_error: "Could not discover a posting URL" };
       fs.writeFileSync("./job-queue.json", JSON.stringify(queue, null, 2));
       console.log("⚠️ Could not discover a posting URL; saved needs_review.");
       return;
     }
 
-    await page.goto(postingUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000
-    });
+    await page.goto(postingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await new Promise(resolve => setTimeout(resolve, 1500));
 
     const data = await page.evaluate(() => ({
