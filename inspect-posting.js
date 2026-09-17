@@ -76,9 +76,9 @@ async function getGoogleResults(page) {
 
 async function resolveSearchResult(page, result) {
   const href = unwrapUrl(result.href);
-  if (!/google\.com$/i.test(new URL(href).hostname)) return href;
-
   try {
+    const host = new URL(href).hostname;
+    if (!/google\.com$/i.test(host)) return href;
     await page.goto(href, { waitUntil: "domcontentloaded", timeout: 30000 });
     await new Promise(resolve => setTimeout(resolve, 800));
     return page.url();
@@ -137,12 +137,17 @@ async function findOfficialApplication(page, job, data) {
     const results = await getGoogleResults(page);
     const likely = results.filter(result => {
       const text = normalize(`${result.text} ${result.href}`);
-      return isLikelyOfficial(result.href, job.company) &&
-        (/apply|application|careers|job|engineer|apprentice|rp1038677/i.test(text) || /myworkdayjobs\.com/i.test(text));
+      return /apply|application|careers|job|engineer|apprentice|rp1038677/i.test(text) ||
+        /myworkdayjobs\.com|f5\.com/i.test(text);
     });
 
-    for (const result of likely.slice(0, 5)) {
+    for (const result of likely.slice(0, 8)) {
+      // Google may expose an opaque /goto?url=CAES... link. Do not apply
+      // the official-domain test until that redirect has actually resolved.
       const resolved = await resolveSearchResult(page, result);
+      console.log("↪️ Search result:", result.text.slice(0, 100));
+      console.log("   →", resolved);
+
       if (isLikelyOfficial(resolved, job.company) &&
           /rp1038677|software-engineer-apprentice|f5jobs/i.test(resolved)) {
         console.log("🎯 Official/ATS result resolved:", resolved);
