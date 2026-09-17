@@ -4,6 +4,7 @@
   "description": "Browserbase-powered job discovery, verification, matching, and human-reviewed application preparation.",
   "main": "pipeline.js",
   "scripts": {
+    "status": "node pipeline.js status",
     "discover": "node discover-jobs.js",
     "verify": "node inspect-posting.js",
     "match": "node matcher.js",
