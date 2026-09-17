@@ -48,5 +48,13 @@
     "never_invent_information": true,
     "stop_on_unknown_required_answer": true,
     "stop_before_final_submission": true
-  }
+  },
+  "target_companies": [
+    { "name": "Veeva Systems", "ats": "lever", "slug": "veeva" },
+    { "name": "JumpCloud", "ats": "lever", "slug": "jumpcloud" },
+    { "name": "Meesho", "ats": "lever", "slug": "meesho" },
+    { "name": "Dun & Bradstreet", "ats": "lever", "slug": "dnb" },
+    { "name": "Zeta", "ats": "lever", "slug": "zeta" },
+    { "name": "CRED", "ats": "lever", "slug": "cred" }
+  ]
 }
