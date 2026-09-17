@@ -11,13 +11,29 @@ function normalize(value) {
   return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+function titlePatterns() {
+  return [
+    /software\s+(?:engineer|developer)/i,
+    /software\s+development\s+engineer/i,
+    /\b(?:sde|swe)\b/i,
+    /backend\s+(?:engineer|developer)/i,
+    /full[- ]?stack\s+(?:engineer|developer)/i,
+    /graduate\s+engineer\s+trainee/i,
+    /software\s+(?:engineer|developer)\s+trainee/i,
+    ...(rules.target_roles || []).map(role => new RegExp(
+      `\\b${String(role).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
+      "i"
+    ))
+  ];
+}
+
 function looksLikeTargetTitle(title) {
   const value = normalize(title);
-  return (rules.target_roles || []).some(role => value.includes(normalize(role)));
+  return titlePatterns().some(pattern => pattern.test(value));
 }
 
 function looksLikeSearchPage(title, url) {
-  return /search results|jobs? in |job search|careers? home|find jobs/i.test(`${title} ${url}`);
+  return /search results|jobs? in |job search|careers? home|find jobs|google\./i.test(`${title} ${url}`);
 }
 
 function canonicalUrl(url) {
@@ -25,10 +41,32 @@ function canonicalUrl(url) {
     const parsed = new URL(url);
     if (!/^https?:$/.test(parsed.protocol)) return null;
     if (/google\./i.test(parsed.hostname)) return null;
+    parsed.hash = "";
     return parsed.href;
   } catch {
     return null;
   }
+}
+
+function extractTitle(text) {
+  const lines = String(text || "")
+    .split(/\n|\r/)
+    .map(line => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  const targetLine = lines.find(line => looksLikeTargetTitle(line));
+  if (targetLine) return targetLine.slice(0, 180);
+
+  const targetInline = lines.join(" ").match(/[^|•]{0,100}(?:software|backend|full[- ]?stack|sde|swe)[^|•]{0,100}/i);
+  return (targetInline ? targetInline[0] : lines[0] || "Unknown role").slice(0, 180).trim();
+}
+
+function buildQueries() {
+  const locations = rules.locations || ["Hyderabad", "Bangalore", "Remote India"];
+  const roleQueries = ["Software Engineer", "SDE", "Software Developer"];
+  return locations.flatMap(location =>
+    roleQueries.map(role => `"${role}" fresher "${location}" jobs`)
+  );
 }
 
 async function main() {
@@ -36,11 +74,7 @@ async function main() {
     throw new Error("BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID are required");
   }
 
-  const queries = [
-    `"Software Engineer" fresher Hyderabad jobs`,
-    `"Software Engineer" fresher Bangalore jobs`,
-    `"Software Engineer" "Remote India" fresher jobs`
-  ];
+  const queries = buildQueries();
 
   const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
   const session = await bb.sessions.create({
@@ -69,18 +103,23 @@ async function main() {
 
       for (const result of results) {
         const href = canonicalUrl(result.href);
+        const title = extractTitle(result.text);
         if (!href || looksLikeSearchPage(result.text, href)) continue;
-        if (!looksLikeTargetTitle(result.text)) continue;
+        if (!looksLikeTargetTitle(title)) continue;
+        if (/^(images|videos|news|maps|shopping|more)$/i.test(title)) continue;
 
         const existing = discovered.find(x => x.posting_url === href);
-        if (existing) continue;
+        if (existing) {
+          existing.source_context.push(query, result.text);
+          continue;
+        }
 
         discovered.push({
-          title: result.text.slice(0, 180),
+          title,
           company: "Unknown",
-          location: query.includes("Bangalore")
+          location: /bangalore/i.test(query)
             ? "Bangalore, India"
-            : query.includes("Hyderabad")
+            : /hyderabad/i.test(query)
               ? "Hyderabad, India"
               : "Remote India",
           posting_url: href,
