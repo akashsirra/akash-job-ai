@@ -7,8 +7,8 @@ const Browserbase = require("@browserbasehq/sdk");
 function unwrapUrl(value) {
   try {
     const url = new URL(value);
-    if (!/google\.com$/i.test(url.hostname)) return url.href;
-    const target = url.searchParams.get("url") || url.searchParams.get("q");
+    if (!/google\.[^/]+$/i.test(url.hostname)) return url.href;
+    const target = url.searchParams.get("url") || url.searchParams.get("q") || url.searchParams.get("uddg");
     return target ? decodeURIComponent(target) : url.href;
   } catch {
     return value;
@@ -29,9 +29,16 @@ function isLikelyOfficial(url, company) {
     if (compact && host.includes(compact)) return true;
     if (firstToken && firstToken.length >= 2 && host.includes(firstToken)) return true;
 
-    return /(^|\.)((myworkdayjobs|greenhouse|lever|ashbyhq)\.com)$/i.test(host) ||
-      /(^|\.)(workday|icims|smartrecruiters)\./i.test(host) ||
-      /careers?|jobs?/i.test(host);
+    // ATS platforms commonly use company-specific subdomains, e.g. f5.wd5.myworkdayjobs.com.
+    if (/(^|\.)myworkdayjobs\.com$/i.test(host)) return true;
+    if (/(^|\.)greenhouse\.io$/i.test(host)) return true;
+    if (/(^|\.)lever\.co$/i.test(host)) return true;
+    if (/(^|\.)ashbyhq\.com$/i.test(host)) return true;
+    if (/(^|\.)icims\.com$/i.test(host)) return true;
+    if (/(^|\.)smartrecruiters\.com$/i.test(host)) return true;
+    if (/(^|\.)workday\.com$/i.test(host)) return true;
+
+    return /(^|\.)((careers?|jobs?)\.[a-z0-9.-]+)$/i.test(host);
   } catch {
     return false;
   }
@@ -102,10 +109,13 @@ async function findOfficialApplication(page, job, data) {
   const official = candidates.find(link => isLikelyOfficial(link.href, job.company));
   if (official) return official.href;
 
+  // Search several precise forms. All searches reuse the SAME Browserbase page/session.
   const queries = [
+    `site:myworkdayjobs.com "${job.title}" "RP1038677"`,
+    `site:myworkdayjobs.com "${job.title}" "${job.company}" Hyderabad`,
+    `site:f5.com "${job.title}" "RP1038677"`,
     `site:f5.com "${job.title}" Hyderabad`,
-    `site:myworkdayjobs.com "${job.title}" "${job.company}"`,
-    `"${job.title}" "${job.company}" official careers`
+    `"${job.title}" "${job.company}" "RP1038677" official careers`
   ];
 
   console.log("🔎 No official application link exposed; searching official company/ATS results in the same session...");
@@ -116,16 +126,18 @@ async function findOfficialApplication(page, job, data) {
       waitUntil: "domcontentloaded",
       timeout: 60000
     });
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    await new Promise(resolve => setTimeout(resolve, 900));
 
     const results = await getGoogleResults(page);
-    const match = results.find(result => {
-      const href = unwrapUrl(result.href);
-      return isLikelyOfficial(href, job.company) &&
-        /apply|application|careers|job|engineer|apprentice/i.test(`${result.text} ${href}`);
-    }) || results.find(result => isLikelyOfficial(unwrapUrl(result.href), job.company));
+    const matches = results
+      .map(result => ({ ...result, href: unwrapUrl(result.href) }))
+      .filter(result => isLikelyOfficial(result.href, job.company))
+      .filter(result => /apply|application|careers|job|engineer|apprentice|RP1038677/i.test(`${result.text} ${result.href}`));
 
-    if (match) return unwrapUrl(match.href);
+    if (matches.length) {
+      console.log("🔗 Official/ATS candidate:", matches[0].href);
+      return matches[0].href;
+    }
   }
 
   return null;
