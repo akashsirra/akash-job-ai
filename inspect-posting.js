@@ -7,12 +7,16 @@ const Browserbase = require("@browserbasehq/sdk");
 function isLikelyOfficial(url, company) {
   try {
     const host = new URL(url).hostname.toLowerCase();
-    const companyToken = String(company || "")
+    const compact = String(company || "")
       .toLowerCase()
       .replace(/[^a-z0-9]/g, "");
+    const firstToken = String(company || "")
+      .toLowerCase()
+      .split(/\s+/)[0]
+      .replace(/[^a-z0-9]/g, "");
 
-    if (!companyToken) return false;
-    if (host.includes(companyToken)) return true;
+    if (compact && host.includes(compact)) return true;
+    if (firstToken && firstToken.length >= 2 && host.includes(firstToken)) return true;
 
     return /(^|\.)((myworkdayjobs|greenhouse|lever|ashbyhq)\.com)$/i.test(host) ||
       /(^|\.)(workday|icims|smartrecruiters)\./i.test(host) ||
@@ -22,15 +26,58 @@ function isLikelyOfficial(url, company) {
   }
 }
 
-async function main() {
-  const queue = JSON.parse(fs.readFileSync("./job-queue.json", "utf8"));
-  const index = queue.findIndex(job =>
-    job.status !== "verified" && job.posting_url
+function normalize(value) {
+  return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function relevantSearchResult(result, job) {
+  const text = normalize(`${result.text} ${result.href}`);
+  const title = normalize(job.title);
+  const company = normalize(job.company);
+  const titleWords = title
+    .split(/[^a-z0-9]+/)
+    .filter(word => word.length >= 4 && !["software", "engineer", "apprentice"].includes(word));
+
+  return (
+    text.includes(company) ||
+    text.includes("f5.com") ||
+    titleWords.some(word => text.includes(word))
+  );
+}
+
+async function discoverPostingUrl(page, job) {
+  const query = `"${job.title}" "${job.company}" ${job.location || ""}`;
+  const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+
+  console.log("🔎 No posting URL stored; searching for the posting...");
+  await page.goto(searchUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
+  await new Promise(resolve => setTimeout(resolve, 1200));
+
+  const results = await page.evaluate(() =>
+    [...document.querySelectorAll("a")]
+      .map(a => ({
+        text: (a.innerText || "").trim().replace(/\s+/g, " "),
+        href: a.href
+      }))
+      .filter(x => x.text && x.href && !/google\.com\/search/i.test(x.href))
   );
 
+  const match = results.find(result => relevantSearchResult(result, job));
+  if (!match) return null;
+
+  console.log("🔗 Discovered posting:", match.href);
+  return match.href;
+}
+
+async function main() {
+  const queue = JSON.parse(fs.readFileSync("./job-queue.json", "utf8"));
+  const index = queue.findIndex(job => job.status !== "verified");
+
   if (index === -1) {
-    console.log("No unverified job with a posting_url is waiting.");
-    console.log("Run discovery first to add posting URLs.");
+    console.log("No unverified job is waiting.");
     return;
   }
 
@@ -38,7 +85,7 @@ async function main() {
   console.log("\n🤖 VERIFYING ONE JOB\n");
   console.log("Title:", job.title);
   console.log("Company:", job.company);
-  console.log("Posting URL:", job.posting_url);
+  console.log("Posting URL:", job.posting_url || "not stored — discovery will run inside this verification session");
 
   if (!process.env.BROWSERBASE_API_KEY || !process.env.BROWSERBASE_PROJECT_ID) {
     throw new Error("BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID are required");
@@ -56,7 +103,20 @@ async function main() {
   const page = await browser.newPage();
 
   try {
-    await page.goto(job.posting_url, {
+    const postingUrl = job.posting_url || await discoverPostingUrl(page, job);
+
+    if (!postingUrl) {
+      queue[index] = {
+        ...job,
+        status: "needs_review",
+        verification_error: "Could not discover a posting URL"
+      };
+      fs.writeFileSync("./job-queue.json", JSON.stringify(queue, null, 2));
+      console.log("⚠️ Could not discover a posting URL; saved needs_review.");
+      return;
+    }
+
+    await page.goto(postingUrl, {
       waitUntil: "domcontentloaded",
       timeout: 60000
     });
@@ -76,13 +136,17 @@ async function main() {
       isLikelyOfficial(link.href, job.company)
     ) || data.links.find(link => isLikelyOfficial(link.href, job.company));
 
+    const officialUrl = official ? official.href :
+      (isLikelyOfficial(data.url, job.company) ? data.url : job.official_url);
+
     queue[index] = {
       ...job,
+      posting_url: postingUrl,
       resolved_url: data.url,
       page_title: data.title,
       description: data.text,
-      official_url: official ? official.href : job.official_url,
-      status: official || isLikelyOfficial(data.url, job.company) ? "verified" : "needs_review",
+      official_url: officialUrl,
+      status: officialUrl ? "verified" : "needs_review",
       verified_at: new Date().toISOString()
     };
 
@@ -90,7 +154,7 @@ async function main() {
 
     console.log("\n🌐 FINAL URL:\n" + data.url);
     console.log("\n📄 PAGE TITLE:\n" + data.title);
-    console.log("\n🔗 OFFICIAL APPLICATION:\n" + (queue[index].official_url || "Not identified"));
+    console.log("\n🔗 OFFICIAL APPLICATION:\n" + (officialUrl || "Not identified"));
     console.log("\n💾 Saved verification to job-queue.json");
   } finally {
     await browser.close();
