@@ -4,179 +4,116 @@ const profile = JSON.parse(fs.readFileSync("./profile.json", "utf8"));
 const rules = JSON.parse(fs.readFileSync("./job-rules.json", "utf8"));
 
 function normalize(value) {
-  return String(value || "").toLowerCase();
+  return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function profileText() {
-  return JSON.stringify(profile).toLowerCase();
+function flattenProfileSkills(data) {
+  const skills = [];
+  for (const value of Object.values(data.skills || {})) {
+    if (Array.isArray(value)) skills.push(...value);
+  }
+  return [...new Set(skills.map(normalize).filter(Boolean))];
 }
 
-// Core mandatory requirements detected from job descriptions.
-// These are deliberately separate from preferred_skills in job-rules.json.
-const mandatoryRequirements = [
-  ["C Programming", ["c programming", "c language"]],
-  ["Memory Management", ["memory management"]],
-  ["Pointers", ["pointers"]],
-  ["Structures", ["structures"]],
-  ["Data Structures", ["data structures"]],
-  ["Algorithms", ["algorithms"]],
-  ["Python", ["python"]],
-  ["Shell Scripting", ["shell scripting", "shell script"]],
-  ["Operating Systems", ["operating systems", "os internals"]],
-  ["Processes", ["processes"]],
-  ["Threads", ["threads"]],
-  ["Synchronization", ["synchronization"]],
-  ["Scheduling", ["scheduling"]],
-  ["Interrupts", ["interrupts"]],
-  ["Embedded Systems", ["embedded systems", "embedded software"]],
-  ["Computer Architecture", ["computer architecture"]],
-  ["ARM Architecture", ["arm architecture", "armv8", "armv9"]],
-  ["Microprocessors", ["microprocessors", "microprocessor"]],
-  ["Bit Manipulation", ["bit manipulation"]],
-  ["Binary Arithmetic", ["binary arithmetic"]],
-  ["Boolean Logic", ["boolean logic"]],
-  ["Low-Level Programming", ["low-level programming", "low level programming"]],
-  ["Git", ["git"]],
-  ["Version Control", ["version control"]],
-  ["Secure Coding", ["secure coding"]],
-  ["Software Quality", ["software quality", "quality principles"]]
-];
-
-function requirementMentioned(text, aliases) {
-  return aliases.some(alias => text.includes(alias));
+function experienceYears(text) {
+  const re = /\b(\d+(?:\.\d+)?)\s*(?:\+|or more)?\s*(?:years?|yrs?)\s*(?:of)?\s*(?:experience)?/ig;
+  let max = null;
+  for (const match of text.matchAll(re)) {
+    const value = Number(match[1]);
+    if (Number.isFinite(value)) max = max === null ? value : Math.max(max, value);
+  }
+  return max;
 }
 
-function profileHasRequirement(profile, aliases) {
-  const text = profileText();
-
-  return aliases.some(alias => {
-    if (text.includes(alias)) return true;
-
-    // Related evidence from the resume/profile.
-    if (
-      alias === "software quality" ||
-      alias === "quality principles"
-    ) {
-      return (
-        text.includes("testing") ||
-        text.includes("regression testing") ||
-        text.includes("debugging")
-      );
-    }
-
-    if (alias === "version control") {
-      return text.includes("git") || text.includes("github");
-    }
-
-    return false;
-  });
+function hasFresherSignal(text) {
+  return /\b(fresher|freshers|entry[- ]level|graduate|new grad|early career|trainee|0\s*[-–]\s*1\s*years?)\b/i.test(text);
 }
 
 function matchJob(job) {
-  const jobText = normalize(
-    `${job.title || ""} ${job.location || ""} ${
-      job.description || ""
-    } ${job.source_context || ""}`
+  const text = normalize(
+    `${job.title || ""} ${job.location || ""} ${job.description || ""} ${(job.source_context || []).join(" ")}`
   );
 
-  const roleMatch = rules.target_roles.some(role =>
-    jobText.includes(normalize(role))
+  const title = normalize(job.title || "");
+  const roleMatch = (rules.target_roles || []).some(role =>
+    title.includes(normalize(role))
   );
 
-  const locationMatch = rules.locations.some(location =>
-    jobText.includes(normalize(location))
+  const locationMatch = (rules.locations || []).some(location =>
+    text.includes(normalize(location))
   );
 
-  const rejected = rules.reject_if.find(reason =>
-    jobText.includes(normalize(reason))
+  const rejected = (rules.reject_if || []).find(reason =>
+    text.includes(normalize(reason))
   );
 
-  const detectedMandatory = mandatoryRequirements.filter(
-    ([, aliases]) => requirementMentioned(jobText, aliases)
+  const maxYears = Number(rules.experience?.max_years ?? 1);
+  const detectedExperienceYears = experienceYears(text);
+  const fresherSignal = hasFresherSignal(text);
+  const overExperience =
+    detectedExperienceYears !== null &&
+    detectedExperienceYears > maxYears &&
+    !fresherSignal;
+
+  const profileSkills = flattenProfileSkills(profile);
+  const preferredSkills = (rules.preferred_skills || []).map(normalize);
+  const jobSkillsMentioned = preferredSkills.filter(skill => text.includes(skill));
+  const skillMatches = jobSkillsMentioned.filter(skill =>
+    profileSkills.includes(skill)
   );
-
-  const directMatches = detectedMandatory
-    .filter(([name, aliases]) => {
-      const text = profileText();
-
-      if (
-        name === "Version Control" &&
-        (text.includes("git") || text.includes("github"))
-      ) {
-        return true;
-      }
-
-      return aliases.some(alias => text.includes(alias));
-    })
-    .map(([name]) => name);
-
-  const relatedEvidence = detectedMandatory
-    .filter(([name]) =>
-      name === "Software Quality" &&
-      ["testing", "regression testing", "debugging"]
-        .some(x => profileText().includes(x))
-    )
-    .map(([name]) => name)
-    .filter(name => !directMatches.includes(name));
-
-  const missingSkills = detectedMandatory
-    .map(([name]) => name)
-    .filter(name =>
-      !directMatches.includes(name) &&
-      !relatedEvidence.includes(name)
-    );
-
-  const totalMandatory = detectedMandatory.length;
-
-  const matchScore =
-    totalMandatory === 0
-      ? 0
-      : Math.round((directMatches.length / totalMandatory) * 100);
-
-  const strongMatch = matchScore >= 70;
 
   let status = "needs_review";
+  let rejectedReason = null;
 
   if (rejected) {
     status = "rejected";
-  } else if (!roleMatch || !locationMatch) {
+    rejectedReason = `Rejected rule matched: ${rejected}`;
+  } else if (!roleMatch) {
     status = "rejected";
-  } else if (totalMandatory === 0) {
-    status = "needs_review";
-  } else if (strongMatch) {
+    rejectedReason = "Target role not detected";
+  } else if (!locationMatch) {
+    status = "rejected";
+    rejectedReason = "Target location not detected";
+  } else if (overExperience) {
+    status = "rejected";
+    rejectedReason = `Experience requirement exceeds ${maxYears} year`;
+  } else if (
+    skillMatches.length >= 2 ||
+    (fresherSignal && skillMatches.length >= 1)
+  ) {
     status = "candidate";
   }
+
+  const matchScore = jobSkillsMentioned.length
+    ? Math.round((skillMatches.length / jobSkillsMentioned.length) * 100)
+    : 0;
 
   return {
     eligible: status === "candidate",
     status,
     roleMatch,
     locationMatch,
-    mandatoryRequirementsDetected: totalMandatory,
-    directMatches,
-    relatedEvidence,
-    missingSkills,
+    fresherSignal,
+    detectedExperienceYears,
+    skillMatches,
+    missingPreferredSkills: jobSkillsMentioned.filter(
+      skill => !skillMatches.includes(skill)
+    ),
     matchScore,
-    directCoverage: `${directMatches.length}/${totalMandatory}`,
-    rejectedReason: rejected || null
+    rejectedReason
   };
 }
 
 module.exports = { matchJob };
 
 if (require.main === module) {
-  const queue = JSON.parse(
-    fs.readFileSync("./job-queue.json", "utf8")
-  );
-
-  if (!queue.length) {
-    console.log("No jobs in queue.");
-    process.exit(0);
+  const queue = JSON.parse(fs.readFileSync("./job-queue.json", "utf8"));
+  console.log("\n🤖 AKASH JOB AI — REQUIREMENT MATCH\n");
+  for (const job of queue) {
+    console.log(JSON.stringify({
+      title: job.title,
+      company: job.company,
+      match: matchJob(job)
+    }, null, 2));
   }
-
-  console.log(
-    "\n🤖 AKASH JOB AI — REQUIREMENT MATCH\n"
-  );
-
-  console.log(JSON.stringify(matchJob(queue[0]), null, 2));
 }
