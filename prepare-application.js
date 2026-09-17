@@ -10,10 +10,8 @@ const rules = JSON.parse(fs.readFileSync("./job-rules.json", "utf8"));
 const queue = JSON.parse(fs.readFileSync("./job-queue.json", "utf8"));
 
 const STOP_BEFORE_SUBMIT = rules.application_policy?.stop_before_final_submission !== false;
+const NEVER_FILL = /password|otp|verification code|captcha|resume|cv upload|cover letter|signature/i;
 
-// ---------- field → value mapping ----------
-// Extend this as your profile.json grows. Anything not mapped here is left
-// for you to fill by hand (better a blank field than an invented answer).
 function fieldKey(field) {
   return `${field.label || ""} ${field.name || ""} ${field.id || ""} ${field.placeholder || ""} ${field.autocomplete || ""}`.toLowerCase();
 }
@@ -21,6 +19,7 @@ function fieldKey(field) {
 function valueForField(field) {
   const key = fieldKey(field);
   const parts = String(profile.name || "").trim().split(/\s+/);
+  const education = profile.education || {};
 
   if (/first.*name|given.*name/.test(key)) return parts[0] || null;
   if (/last.*name|family.*name|surname/.test(key)) return parts.slice(1).join(" ") || null;
@@ -36,16 +35,41 @@ function valueForField(field) {
   if (/country/.test(key)) return profile.country || null;
   if (/current (ctc|salary)|expected (ctc|salary)/.test(key)) return profile.expected_salary || null;
   if (/notice period/.test(key)) return profile.notice_period || null;
-  if (/graduation year|passing year/.test(key)) return profile.graduation_year || null;
-  if (/university|college|institution/.test(key)) return profile.university || null;
+  if (/graduation year|passing year/.test(key)) return profile.graduation_year ?? education.graduation_year ?? null;
+  if (/university|college|institution/.test(key)) return profile.university || education.university || null;
+  if (/degree|qualification/.test(key)) return profile.degree || education.degree || null;
 
   return null;
 }
 
-// Fields we will never auto-fill, even if we could pattern-match a guess.
-const NEVER_FILL = /password|otp|verification code|captcha|resume|cv upload|cover letter|signature/i;
+function cssAttribute(name, value) {
+  const escaped = String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\A ");
+  return `[${name}="${escaped}"]`;
+}
 
-// ---------- page inspection ----------
+function selectorForField(field) {
+  if (field.id) return cssAttribute("id", field.id);
+  if (field.name) return cssAttribute("name", field.name);
+  return null;
+}
+
+function normalizeOption(value) {
+  return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function chooseOption(options, desired) {
+  const target = normalizeOption(desired);
+  return (options || []).find(option =>
+    normalizeOption(option.value) === target ||
+    normalizeOption(option.text) === target ||
+    normalizeOption(option.text).includes(target) ||
+    target.includes(normalizeOption(option.text))
+  ) || null;
+}
+
 async function inspectFields(page) {
   const inspect = frame => frame.evaluate(() => [...document.querySelectorAll("input, textarea, select")]
     .map((el, index) => ({
@@ -55,20 +79,28 @@ async function inspectFields(page) {
       name: el.name || "",
       id: el.id || "",
       label: el.labels?.[0]?.innerText?.trim()
-        || document.querySelector(`label[for="${CSS.escape(el.id || "")}"]`)?.innerText?.trim()
-        || "",
+        || (el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`)?.innerText?.trim() : "")
+        || el.getAttribute("aria-label") || "",
       placeholder: el.placeholder || "",
       autocomplete: el.autocomplete || "",
-      required: Boolean(el.required),
+      required: Boolean(el.required || el.getAttribute("aria-required") === "true"),
+      disabled: Boolean(el.disabled),
+      readOnly: Boolean(el.readOnly),
+      visible: (() => {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+      })(),
       options: el.tagName.toLowerCase() === "select"
-        ? [...el.options].map(o => o.textContent.trim())
+        ? [...el.options].map(o => ({ text: o.textContent.trim(), value: o.value }))
         : undefined
     })));
 
   for (const frame of page.frames()) {
     try {
       const fields = await inspect(frame);
-      if (fields.length) return { frame, fields };
+      const usable = fields.filter(field => field.visible && !field.disabled);
+      if (usable.length) return { frame, fields: usable };
     } catch {}
   }
   return { frame: null, fields: [] };
@@ -82,12 +114,23 @@ async function findApplyInFrame(frame) {
       return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
     };
     const text = el => (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").replace(/\s+/g, " ").trim();
-    const el = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit],div,span")].find(x => {
-      const t = text(x);
-      return visible(x) && (/^apply( now)?$/i.test(t) || /apply now|apply for this job/i.test(t)) && !/add to cart|save/i.test(t);
-    });
-    if (!el) return null;
-    return { text: text(el), href: el.closest("a")?.href || el.href || "", tag: el.tagName.toLowerCase() };
+    const candidates = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")]
+      .filter(visible)
+      .map(el => ({
+        el,
+        text: text(el),
+        href: el.closest("a")?.href || el.href || ""
+      }))
+      .filter(x => x.text && /\bapply(?: now| for this job)?\b/i.test(x.text))
+      .filter(x => !/save|add to cart|filters?|search/i.test(x.text));
+
+    if (!candidates.length) return null;
+    const best = candidates.sort((a, b) => {
+      const score = value => (/^apply(?: now)?$/i.test(value) ? 3 : /apply for this job/i.test(value) ? 2 : 1);
+      return score(b.text) - score(a.text);
+    })[0];
+
+    return { text: best.text, href: best.href, tag: best.el.tagName.toLowerCase() };
   });
 }
 
@@ -98,7 +141,6 @@ async function clickApply(page) {
       if (!apply) continue;
 
       console.log("🔘 Apply control:", apply.text, apply.href || "(button)");
-
       if (apply.href && !/^javascript:/i.test(apply.href)) return apply.href;
 
       const before = page.url();
@@ -110,10 +152,8 @@ async function clickApply(page) {
           return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
         };
         const text = el => (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").replace(/\s+/g, " ").trim();
-        const el = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit],div,span")].find(x => {
-          const t = text(x);
-          return visible(x) && (/^apply( now)?$/i.test(t) || /apply now|apply for this job/i.test(t)) && !/add to cart|save/i.test(t);
-        });
+        const el = [...document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")]
+          .find(x => visible(x) && /\bapply(?: now| for this job)?\b/i.test(text(x)) && !/save|add to cart|filters?|search/i.test(text(x)));
         if (el) el.click();
       });
 
@@ -123,20 +163,12 @@ async function clickApply(page) {
       const pagesAfter = await page.browser().pages();
       const popup = pagesAfter.find(p => !pagesBefore.includes(p) && p.url() !== "about:blank");
       if (popup) return popup;
-
       return null;
     } catch {}
   }
   return null;
 }
 
-async function pageText(page) {
-  return page.evaluate(() => document.body?.innerText?.slice(0, 16000) || "").catch(() => "");
-}
-
-// ---------- live field filling ----------
-// Actually types/selects values into the page. Never touches NEVER_FILL
-// fields and never writes a value we didn't already map with confidence.
 async function fillFields(frame, fields) {
   const filled = [];
   const skipped = [];
@@ -149,36 +181,59 @@ async function fillFields(frame, fields) {
       continue;
     }
 
+    if (field.readOnly) {
+      skipped.push({ ...field, reason: "readonly" });
+      continue;
+    }
+
     const value = valueForField(field);
-    if (!value) {
+    if (value === null || value === undefined || value === "") {
       if (field.required) skipped.push({ ...field, reason: "no_mapped_value" });
       continue;
     }
 
-    try {
-      const selector = field.id ? `#${CSS.escape(field.id)}`
-        : field.name ? `[name="${CSS.escape(field.name)}"]`
-        : null;
-      if (!selector) { skipped.push({ ...field, reason: "no_selector" }); continue; }
+    const selector = selectorForField(field);
+    if (!selector) {
+      if (field.required) skipped.push({ ...field, reason: "no_selector" });
+      continue;
+    }
 
+    try {
       const handle = await frame.$(selector);
-      if (!handle) { skipped.push({ ...field, reason: "selector_not_found" }); continue; }
+      if (!handle) {
+        skipped.push({ ...field, reason: "selector_not_found" });
+        continue;
+      }
 
       if (field.tag === "select") {
-        const optionMatch = (field.options || []).find(
-          o => o.toLowerCase().includes(String(value).toLowerCase())
-        );
-        if (optionMatch) {
-          await handle.select(optionMatch).catch(() => {});
-          filled.push({ ...field, value: optionMatch });
-        } else {
+        const option = chooseOption(field.options, value);
+        if (!option) {
           skipped.push({ ...field, reason: "no_matching_option" });
+          await handle.dispose();
+          continue;
         }
+        await handle.select(option.value);
+        const actual = await handle.evaluate(el => el.options[el.selectedIndex]?.value || "");
+        if (actual !== option.value) {
+          skipped.push({ ...field, reason: "select_verification_failed" });
+        } else {
+          filled.push({ ...field, value: option.text });
+        }
+      } else if (/^(checkbox|radio)$/i.test(field.type)) {
+        skipped.push({ ...field, reason: "choice_requires_explicit_profile_value" });
       } else {
         await handle.click({ clickCount: 3 }).catch(() => {});
-        await handle.type(String(value), { delay: 15 }).catch(() => {});
-        filled.push({ ...field, value });
+        await handle.press("Backspace").catch(() => {});
+        await handle.type(String(value), { delay: 15 });
+        const actual = await handle.evaluate(el => el.value || "");
+        if (actual === String(value)) {
+          filled.push({ ...field, value });
+        } else {
+          skipped.push({ ...field, reason: "input_verification_failed" });
+        }
       }
+
+      await handle.dispose();
     } catch (err) {
       skipped.push({ ...field, reason: `fill_error: ${err.message}` });
     }
@@ -187,13 +242,23 @@ async function fillFields(frame, fields) {
   return { filled, skipped };
 }
 
-// ---------- main ----------
+async function pageText(page) {
+  return page.evaluate(() => document.body?.innerText?.slice(0, 16000) || "").catch(() => "");
+}
+
 async function main() {
-  const candidate = queue.find(job => job.official_url && job.status === "verified" && matchJob(job).eligible);
+  const candidate = queue.find(job =>
+    job.official_url &&
+    job.status === "verified" &&
+    job.application_status !== "applied" &&
+    matchJob(job).eligible
+  );
+
   if (!candidate) {
     console.log("No verified eligible job is ready for application preparation.");
     return;
   }
+
   if (!process.env.BROWSERBASE_API_KEY || !process.env.BROWSERBASE_PROJECT_ID) {
     throw new Error("BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID are required");
   }
@@ -208,7 +273,6 @@ async function main() {
   const browser = await puppeteer.connect({ browserWSEndpoint: session.connectUrl });
   let page = await browser.newPage();
 
-  // Live-view link so you can watch, and take over for the final click.
   const debug = await bb.sessions.debug(session.id).catch(() => null);
   const liveViewUrl = debug?.debuggerFullscreenUrl || debug?.debuggerUrl || null;
 
@@ -218,8 +282,6 @@ async function main() {
 
     let applicationUrl = page.url();
     let { frame, fields } = await inspectFields(page);
-    let body = await pageText(page);
-
     console.log("🌐 Loaded:", applicationUrl);
 
     const applyTarget = await clickApply(page);
@@ -236,16 +298,15 @@ async function main() {
       }
       applicationUrl = page.url();
       ({ frame, fields } = await inspectFields(page));
-      body = await pageText(page);
     }
 
-    let filled = [], skipped = [];
+    let filled = [];
+    let skipped = [];
     if (frame && fields.length) {
       ({ filled, skipped } = await fillFields(frame, fields));
     }
 
     const unknownRequired = skipped.filter(f => f.required);
-
     const result = {
       prepared_at: new Date().toISOString(),
       company: candidate.company,
@@ -262,7 +323,7 @@ async function main() {
 
     console.log(`\n📋 Application URL: ${applicationUrl}`);
     console.log(`✅ Fields filled live: ${filled.length}`);
-    console.log(`⚠️  Fields skipped: ${skipped.length} (of which required: ${unknownRequired.length})`);
+    console.log(`⚠️ Fields skipped: ${skipped.length} (of which required: ${unknownRequired.length})`);
     if (unknownRequired.length) {
       console.log("   Needs your input:");
       unknownRequired.forEach(f => console.log(`   - ${f.label || f.name || f.id} (${f.reason})`));
@@ -271,20 +332,16 @@ async function main() {
 
     if (STOP_BEFORE_SUBMIT) {
       console.log("\n🛑 stop_before_final_submission is ON (job-rules.json).");
-      console.log("   The form is filled and the session is staying open.");
-      if (liveViewUrl) console.log(`   Review & submit yourself here: ${liveViewUrl}`);
-      console.log("   Press Ctrl+C once you're done to close the session.");
-      await new Promise(() => {}); // hold the process open; user reviews & submits manually
+      console.log("   Review the live form and submit it yourself.");
+      if (liveViewUrl) console.log(`   Live view: ${liveViewUrl}`);
+      console.log("   After you submit manually, run: npm run mark-applied -- --confirm");
+      await new Promise(() => {});
     } else {
-      console.log("\n⚠️  stop_before_final_submission is OFF — closing session without submitting.");
-      console.log("   (This script still never clicks Submit itself.)");
+      console.log("\n⚠️ stop_before_final_submission is OFF — closing session without submitting.");
+      console.log("   This script never clicks Submit itself.");
     }
   } finally {
-    if (STOP_BEFORE_SUBMIT) {
-      // session stays open deliberately — closed manually or via Browserbase dashboard/timeout
-    } else {
-      await browser.close();
-    }
+    if (!STOP_BEFORE_SUBMIT) await browser.close();
   }
 }
 
