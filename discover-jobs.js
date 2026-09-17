@@ -39,7 +39,7 @@ function canonicalUrl(url) {
   try {
     const parsed = new URL(url);
     if (!/^https?:$/.test(parsed.protocol)) return null;
-    if (/(^|\.)google\./i.test(parsed.hostname)) return null;
+    if (/(^|\\.)google\\./i.test(parsed.hostname)) return null;
     parsed.hash = "";
     return parsed.href;
   } catch {
@@ -190,9 +190,6 @@ function isUsefulLocation(location, rules) {
   if (/hyderabad/i.test(value)) return true;
   if (/bangalore|bengaluru/i.test(value)) return true;
 
-  // Remote India or worldwide remote is acceptable because the user's rules
-  // explicitly include Remote India. Worldwide roles are allowed only when
-  // the listing does not restrict the candidate's country.
   if (/remote/i.test(value) && (/india/i.test(value) || /worldwide|anywhere/i.test(value))) {
     return (rules.locations || []).some(x => /remote\s*india/i.test(String(x)));
   }
@@ -204,17 +201,14 @@ function isObviouslySenior(candidate) {
   const title = normalize(candidate.title);
   const description = normalize(candidate.description);
 
-  // Title-level seniority is authoritative enough to reject immediately.
   if (/\b(?:senior|sr\.?|staff|principal|lead|director|manager|head|vp|vice president)\b/i.test(title)) {
     return true;
   }
 
-  // Reject numbered engineering levels such as Engineer II/III/IV or SDE II/III.
   if (/\b(?:engineer|developer|sde|swe)\s*(?:[- ]?(?:ii|iii|iv|v|vi)|[- ]?\d{2,})\b/i.test(title)) {
     return true;
   }
 
-  // Reject explicit >1-year requirements when stated in the title or body.
   if (/\b(?:[2-9]|1\d|\d{2,})\s*\+?\s*years?\b/i.test(title)) return true;
   if (/\b(?:[2-9]|1\d|\d{2,})\s*(?:-|to)\s*\d+\s*years?\b/i.test(title)) return true;
   if (/\b(?:[2-9]|1\d|\d{2,})\s*\+?\s*years?\s+(?:of\s+)?experience\b/i.test(description)) return true;
@@ -288,8 +282,6 @@ async function collectCandidates(rules) {
     await sleep(200);
   }
 
-  // India-focused remote API. Search is already constrained to Entry-level +
-  // Full Time + India, so it is much more useful than scraping search pages.
   for (const query of [
     "software engineer",
     "software developer",
@@ -300,7 +292,6 @@ async function collectCandidates(rules) {
     await sleep(250);
   }
 
-  // Secondary remote source; final location/seniority filtering still applies.
   for (const query of ["software engineer", "software developer", "backend engineer"]) {
     candidates.push(...(await fetchRemotive(query)));
     await sleep(200);
