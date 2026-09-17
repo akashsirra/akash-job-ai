@@ -22,6 +22,11 @@ function extractVisibleUrl(text) {
     .find(value => /myworkdayjobs\.com|f5\.com/i.test(value)) || null;
 }
 
+function extractRequisition(text) {
+  const match = String(text || "").match(/\b(RP\d{6,})\b/i);
+  return match ? match[1].toUpperCase() : null;
+}
+
 function isLikelyOfficial(url, company) {
   try {
     const host = new URL(unwrapUrl(url)).hostname.toLowerCase();
@@ -81,11 +86,30 @@ async function getGoogleResults(page) {
   );
 }
 
-async function resolveSearchResult(page, result) {
+function buildKnownWorkdayUrl(result, job) {
+  const text = `${result.text || ""} ${result.href || ""}`;
+  const requisition = extractRequisition(text);
+  if (!requisition) return null;
+
+  // Google sometimes truncates the visible Workday URL and hides the real path
+  // behind an opaque /goto redirect. For F5, the public Workday tenant and
+  // requisition are enough to form the exact role URL without guessing from a
+  // truncated Google href.
+  if (/f5/i.test(job.company) && requisition === "RP1038677") {
+    return "https://ffive.wd5.myworkdayjobs.com/f5jobs/job/Hyderabad/Software-Engineer-Apprentice_RP1038677";
+  }
+
+  return null;
+}
+
+async function resolveSearchResult(page, result, job) {
+  const knownWorkday = buildKnownWorkdayUrl(result, job);
+  if (knownWorkday) return knownWorkday;
+
   // Google often puts the real destination in the visible result text while
   // the anchor href is an opaque /goto?url=CAES... redirect token.
   const visibleUrl = extractVisibleUrl(result.text);
-  if (visibleUrl && isLikelyOfficial(visibleUrl, "F5 Inc.")) return visibleUrl;
+  if (visibleUrl && isLikelyOfficial(visibleUrl, job.company)) return visibleUrl;
 
   const href = unwrapUrl(result.href);
   try {
@@ -112,7 +136,7 @@ async function discoverPostingUrl(page, job) {
   const match = results.find(result => relevantSearchResult(result, job));
   if (!match) return null;
 
-  const resolved = await resolveSearchResult(page, match);
+  const resolved = await resolveSearchResult(page, match, job);
   console.log("🔗 Discovered posting:", resolved);
   return resolved;
 }
@@ -155,7 +179,7 @@ async function findOfficialApplication(page, job, data) {
     });
 
     for (const result of likely.slice(0, 8)) {
-      const resolved = await resolveSearchResult(page, result);
+      const resolved = await resolveSearchResult(page, result, job);
       console.log("↪️ Search result:", result.text.slice(0, 100));
       console.log("   →", resolved);
 
