@@ -1,7 +1,7 @@
 {
   "name": "akash-job-ai",
-  "version": "1.2.0",
-  "description": "Browserbase-powered job discovery with FreeBrowser-powered local application preparation.",
+  "version": "1.3.0",
+  "description": "Job discovery and application preparation with a native Termux browser agent.",
   "main": "pipeline.js",
   "scripts": {
     "status": "node pipeline.js status",
@@ -10,11 +10,13 @@
     "match": "node matcher.js",
     "prepare": "node prepare-application.js",
     "apply": "node freebrowser-apply.js",
+    "apply:native": "node termux-browser-agent.js",
+    "doctor:native": "bash termux-browser-doctor.sh",
     "mark-applied": "node mark-applied.js",
     "pipeline": "node pipeline.js",
     "test": "node test.js"
   },
-  "keywords": ["jobs", "automation", "browserbase", "freebrowser", "job-search"],
+  "keywords": ["jobs","automation","termux","browser","job-search"],
   "author": "Akash Sirra",
   "license": "ISC",
   "type": "commonjs",
